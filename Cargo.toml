@@ -1,0 +1,26 @@
+[package]
+name = "z-sync"
+version = "0.1.0"
+edition = "2024"
+
+[[bench]]
+name = "notify"
+harness = false
+
+[features]
+default = ["std", "thin-vec"]
+std = []
+
+thin-vec = ["dep:thin-vec"]
+
+[dependencies]
+parking_lot_core = "0.9"
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+
+thin-vec = { version = "0.2", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["async_tokio"] }
+tokio = { version = "1", features = ["full"] }
+event-listener = "5.4"
