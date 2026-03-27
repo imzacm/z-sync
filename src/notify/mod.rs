@@ -1,40 +1,18 @@
 mod listener;
 mod select;
-mod waker_queue;
 
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Waker;
 
 use crossbeam_utils::CachePadded;
-use parking_lot::Mutex;
-use parking_lot_core::DEFAULT_UNPARK_TOKEN;
 
 pub use self::listener::NotifyListener;
 pub use self::select::select_blocking;
-use self::waker_queue::WakerQueue;
+use crate::park_strategy::{DefaultParkStrategy, FilterOp, ParkStrategy};
+use crate::waker_queue::WakerQueueLock;
 
 const ASYNC_CAPACITY: usize = 2;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct NotifyState(u64);
-
-impl NotifyState {
-    #[inline(always)]
-    const fn epoch(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-
-    #[inline(always)]
-    const fn parked(self) -> u16 {
-        (self.0 >> 16) as u16
-    }
-
-    #[inline(always)]
-    const fn wakers(self) -> u16 {
-        self.0 as u16
-    }
-}
 
 /// A lightweight notification primitive supporting both blocking and async waiters.
 ///
@@ -46,26 +24,34 @@ impl NotifyState {
 /// once the epoch has advanced past that snapshot, which means a notification
 /// was fired *after* the listener was registered.
 #[derive(Debug)]
-pub struct Notify {
+pub struct Notify<P = DefaultParkStrategy> {
+    _marker: core::marker::PhantomData<P>,
     /// Bit layout:
     /// - 0..16: async wakers count (u16)
     /// - 16..32: parked threads count (u16)
     /// - 32..64: epoch (u32)
     state: CachePadded<AtomicU64>,
-    async_wakers: Mutex<WakerQueue<ASYNC_CAPACITY>>,
+    async_wakers: WakerQueueLock<ASYNC_CAPACITY>,
 }
 
-impl Default for Notify {
+impl<P: ParkStrategy> Default for Notify<P> {
     fn default() -> Self {
-        Self::new()
+        Self::with_park_strategy()
     }
 }
 
-impl Notify {
-    pub fn new() -> Self {
+impl Notify<DefaultParkStrategy> {
+    pub const fn new() -> Self {
+        Self::with_park_strategy()
+    }
+}
+
+impl<P: ParkStrategy> Notify<P> {
+    pub const fn with_park_strategy() -> Self {
         Self {
+            _marker: core::marker::PhantomData,
             state: CachePadded::new(AtomicU64::new(0)),
-            async_wakers: Mutex::new(WakerQueue::new()),
+            async_wakers: WakerQueueLock::new(),
         }
     }
 
@@ -104,7 +90,7 @@ impl Notify {
     /// listener.wait();   // or  listener.await
     /// ```
     #[inline(always)]
-    pub fn listener(&self) -> NotifyListener<'_> {
+    pub fn listener(&self) -> NotifyListener<'_, P> {
         let epoch = self.load_state(Ordering::Acquire).epoch();
         NotifyListener::new(self, epoch)
     }
@@ -186,26 +172,20 @@ impl Notify {
 
         let key = self.parking_key();
         if remaining == usize::MAX {
-            let unparked = unsafe { parking_lot_core::unpark_all(key, DEFAULT_UNPARK_TOKEN) };
+            let unparked = P::unpark_all(key);
             remaining = remaining.saturating_sub(unparked);
             return remaining;
         }
 
         let mut unparked = 0;
-        unsafe {
-            parking_lot_core::unpark_filter(
-                key,
-                |_| {
-                    if unparked < n {
-                        unparked += 1;
-                        parking_lot_core::FilterOp::Unpark
-                    } else {
-                        parking_lot_core::FilterOp::Stop
-                    }
-                },
-                |_| DEFAULT_UNPARK_TOKEN,
-            );
-        }
+        P::unpark_filter(key, || {
+            if unparked < n {
+                unparked += 1;
+                FilterOp::Unpark
+            } else {
+                FilterOp::Stop
+            }
+        });
 
         remaining - unparked
     }
@@ -214,6 +194,26 @@ impl Notify {
     #[inline(always)]
     fn parking_key(&self) -> usize {
         core::ptr::from_ref(&self.state) as usize
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct NotifyState(u64);
+
+impl NotifyState {
+    #[inline(always)]
+    const fn epoch(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    #[inline(always)]
+    const fn parked(self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    #[inline(always)]
+    const fn wakers(self) -> u16 {
+        self.0 as u16
     }
 }
 
@@ -242,5 +242,13 @@ mod tests {
         assert!(!listener.is_notified());
         notify.notify(1);
         assert!(listener.is_notified());
+    }
+
+    #[test]
+    fn verify_struct_sizes() {
+        assert_eq!(
+            size_of::<Notify<crate::park_strategy::ParkingLot>>(),
+            size_of::<Notify<crate::park_strategy::Spin>>()
+        );
     }
 }

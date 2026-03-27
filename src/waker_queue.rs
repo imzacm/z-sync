@@ -1,10 +1,65 @@
 #[cfg(not(feature = "thin-vec"))]
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
+use std::mem::MaybeUninit;
+
+use crossbeam_utils::CachePadded;
+
+/// Allow creating in const functions.
+#[cfg_attr(feature = "thin-vec", derive(Debug))]
+#[cfg(feature = "thin-vec")]
+struct Vec<T> {
+    inner: core::cell::OnceCell<thin_vec::ThinVec<T>>,
+}
 
 #[cfg(feature = "thin-vec")]
-use thin_vec::ThinVec as Vec;
+impl<T> Vec<T> {
+    const fn new() -> Self {
+        Self { inner: core::cell::OnceCell::new() }
+    }
+
+    #[inline(always)]
+    fn get_ref(&self) -> &thin_vec::ThinVec<T> {
+        self.inner.get_or_init(thin_vec::ThinVec::new)
+    }
+
+    #[inline(always)]
+    fn get_mut(&mut self) -> &mut thin_vec::ThinVec<T> {
+        self.get_ref();
+        unsafe { self.inner.get_mut().unwrap_unchecked() }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.get_ref().len()
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: T) {
+        self.get_mut().push(value);
+    }
+}
+
+#[cfg(feature = "thin-vec")]
+impl<T> core::ops::Index<usize> for Vec<T> {
+    type Output = T;
+
+    #[inline(always)]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.get_ref()[index]
+    }
+}
+
+#[cfg(feature = "thin-vec")]
+impl<T> core::ops::IndexMut<usize> for Vec<T> {
+    #[inline(always)]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.get_mut()[index]
+    }
+}
 
 /// An allocation-free, generational doubly-linked list node.
 #[derive(Debug)]
@@ -71,22 +126,38 @@ pub struct WakerQueue<const ARRAY_CAPACITY: usize> {
     free_head: u16,
 }
 
+impl<const ARRAY_CAPACITY: usize> Default for WakerQueue<ARRAY_CAPACITY> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const ARRAY_CAPACITY: usize> WakerQueue<ARRAY_CAPACITY> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         assert!(
             ARRAY_CAPACITY < u16::MAX as usize,
             "WakerQueue capacity must be less than `u16::MAX`"
         );
 
+        let mut nodes_array: [MaybeUninit<WakerNode>; ARRAY_CAPACITY] =
+            unsafe { MaybeUninit::uninit().assume_init() };
+        let mut index = 0;
+        while index < ARRAY_CAPACITY {
+            let next = if index == ARRAY_CAPACITY - 1 {
+                WakerNode::NULL_NODE
+            } else {
+                (index + 1) as u16
+            };
+            nodes_array[index].write(WakerNode::new(WakerNode::NULL_NODE, next));
+
+            index += 1;
+        }
+
+        let nodes_array =
+            unsafe { nodes_array.as_ptr().cast::<[WakerNode; ARRAY_CAPACITY]>().read() };
+
         Self {
-            nodes_array: core::array::from_fn(|index| {
-                let next = if index == ARRAY_CAPACITY - 1 {
-                    WakerNode::NULL_NODE
-                } else {
-                    (index + 1) as u16
-                };
-                WakerNode::new(WakerNode::NULL_NODE, next)
-            }),
+            nodes_array,
             nodes_vec: Vec::new(),
             head: WakerNode::NULL_NODE,
             tail: WakerNode::NULL_NODE,
@@ -218,5 +289,90 @@ impl<const ARRAY_CAPACITY: usize> WakerQueue<ARRAY_CAPACITY> {
         self.free_head = index;
 
         Some(waker)
+    }
+}
+
+/// An exponential backoff spinlock tailored for microscopic critical sections.
+#[derive(Debug)]
+pub struct WakerQueueLock<const CAP: usize> {
+    locked: CachePadded<AtomicBool>,
+    queue: UnsafeCell<WakerQueue<CAP>>,
+}
+
+// SAFETY: The queue is only ever accessed while `locked` is true.
+unsafe impl<const CAP: usize> Sync for WakerQueueLock<CAP> {}
+unsafe impl<const CAP: usize> Send for WakerQueueLock<CAP> {}
+
+impl<const CAP: usize> Default for WakerQueueLock<CAP> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const CAP: usize> WakerQueueLock<CAP> {
+    pub const fn new() -> Self {
+        Self {
+            locked: CachePadded::new(AtomicBool::new(false)),
+            queue: UnsafeCell::new(WakerQueue::new()),
+        }
+    }
+
+    #[inline(always)]
+    pub fn lock(&self) -> WakerQueueGuard<'_, CAP> {
+        if self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return WakerQueueGuard { lock: self };
+        }
+
+        let mut backoff = 1;
+        loop {
+            // This stays cleanly inside the CPU's local L1 cache until the lock holder releases it.
+            while self.locked.load(Ordering::Relaxed) {
+                for _ in 0..backoff {
+                    core::hint::spin_loop();
+                }
+                if backoff < 64 {
+                    backoff <<= 1; // Bitwise shift is microscopically faster than *= 2
+                }
+            }
+
+            // 3. The lock appears free, attempt to grab it
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return WakerQueueGuard { lock: self };
+            }
+        }
+    }
+}
+
+pub struct WakerQueueGuard<'a, const CAP: usize> {
+    lock: &'a WakerQueueLock<CAP>,
+}
+
+impl<'a, const CAP: usize> core::ops::Deref for WakerQueueGuard<'a, CAP> {
+    type Target = WakerQueue<CAP>;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.lock.queue.get() }
+    }
+}
+
+impl<'a, const CAP: usize> core::ops::DerefMut for WakerQueueGuard<'a, CAP> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.lock.queue.get() }
+    }
+}
+
+impl<'a, const CAP: usize> Drop for WakerQueueGuard<'a, CAP> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
     }
 }

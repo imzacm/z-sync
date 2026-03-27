@@ -2,36 +2,35 @@ use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll};
 
-use parking_lot_core::DEFAULT_PARK_TOKEN;
-
 #[cfg(feature = "std")]
 pub use self::timeout::NotifyTimeoutListener;
 use super::Notify;
-use super::waker_queue::WakerTicket;
+use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
+use crate::waker_queue::WakerTicket;
 
 /// A listener that was created from a [`Notify`].
 ///
 /// Supports both blocking (`.wait()`) and async (`.await`) usage.
 #[derive(Debug)]
-pub struct NotifyListener<'a> {
-    notify: &'a Notify,
+pub struct NotifyListener<'a, P: ParkStrategy = DefaultParkStrategy> {
+    notify: &'a Notify<P>,
     /// The epoch snapshot taken when this listener was created.
     epoch: u32,
     waker_node_ticket: Option<WakerTicket>,
 }
 
-impl<'a> NotifyListener<'a> {
-    pub(super) fn new(notify: &'a Notify, epoch: u32) -> Self {
+impl<'a, P: ParkStrategy> NotifyListener<'a, P> {
+    pub(super) fn new(notify: &'a Notify<P>, epoch: u32) -> Self {
         Self { notify, epoch, waker_node_ticket: None }
     }
 
     #[inline(always)]
-    pub fn notification(&self) -> &'a Notify {
+    pub fn notification(&self) -> &'a Notify<P> {
         self.notify
     }
 
     #[inline(always)]
-    pub fn is_notification(&self, notify: &Notify) -> bool {
+    pub fn is_notification(&self, notify: &Notify<P>) -> bool {
         core::ptr::eq(self.notify, notify)
     }
 
@@ -42,7 +41,7 @@ impl<'a> NotifyListener<'a> {
     }
 
     #[cfg(feature = "std")]
-    pub fn with_timeout(self, timeout: std::time::Duration) -> NotifyTimeoutListener<'a> {
+    pub fn with_timeout(self, timeout: std::time::Duration) -> NotifyTimeoutListener<'a, P> {
         NotifyTimeoutListener::new(self, timeout)
     }
 
@@ -62,19 +61,7 @@ impl<'a> NotifyListener<'a> {
         self.notify.add_parkers(1, Ordering::SeqCst);
 
         loop {
-            // SAFETY: We use the epoch address as a stable key.
-            // The validate closure re-checks under the parking_lot_core's
-            // internal lock, preventing missed wakeups.
-            unsafe {
-                parking_lot_core::park(
-                    self.notify.parking_key(),
-                    || !self.is_notified(), // validate: should we actually park?
-                    || {},                  // before_sleep: nothing to do
-                    |_, _| {},              // timed_out: not using timeouts
-                    DEFAULT_PARK_TOKEN,
-                    None, // no timeout
-                );
-            }
+            P::park(self.notify.parking_key(), || !self.is_notified());
 
             if self.is_notified() {
                 self.notify.sub_parkers(1, Ordering::Relaxed);
@@ -89,7 +76,7 @@ impl<'a> NotifyListener<'a> {
 impl<'a> Future for NotifyListener<'a> {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.is_notified() {
             return Poll::Ready(());
         }
@@ -143,7 +130,7 @@ impl<'a> Future for NotifyListener<'a> {
     }
 }
 
-impl<'a> Drop for NotifyListener<'a> {
+impl<'a, P: ParkStrategy> Drop for NotifyListener<'a, P> {
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
             && self.notify.async_wakers.lock().remove(ticket)
@@ -160,23 +147,23 @@ mod timeout {
     use super::*;
 
     #[derive(Debug)]
-    pub struct NotifyTimeoutListener<'a> {
-        listener: NotifyListener<'a>,
+    pub struct NotifyTimeoutListener<'a, P: ParkStrategy = DefaultParkStrategy> {
+        listener: NotifyListener<'a, P>,
         timeout: Duration,
     }
 
-    impl<'a> NotifyTimeoutListener<'a> {
-        pub(super) fn new(listener: NotifyListener<'a>, timeout: Duration) -> Self {
+    impl<'a, P: ParkStrategy> NotifyTimeoutListener<'a, P> {
+        pub(super) fn new(listener: NotifyListener<'a, P>, timeout: Duration) -> Self {
             Self { listener, timeout }
         }
 
         #[inline(always)]
-        pub fn notification(&self) -> &'a Notify {
+        pub fn notification(&self) -> &'a Notify<P> {
             self.listener.notification()
         }
 
         #[inline(always)]
-        pub fn is_notification(&self, notify: &Notify) -> bool {
+        pub fn is_notification(&self, notify: &Notify<P>) -> bool {
             self.listener.is_notification(notify)
         }
 
@@ -228,19 +215,11 @@ mod timeout {
                     return Err(self);
                 }
 
-                // SAFETY: We use the epoch address as a stable key.
-                // The validate closure re-checks under the parking_lot_core's
-                // internal lock, preventing missed wakeups.
-                unsafe {
-                    parking_lot_core::park(
-                        self.listener.notify.parking_key(),
-                        || !self.is_notified() && std::time::Instant::now() < timeout, /* validate: should we actually park? */
-                        || {},     // before_sleep: nothing to do
-                        |_, _| {}, // timed_out
-                        DEFAULT_PARK_TOKEN,
-                        Some(timeout),
-                    );
-                }
+                P::park_timeout(
+                    self.listener.notify.parking_key(),
+                    || !self.is_notified() && std::time::Instant::now() < timeout,
+                    timeout,
+                );
 
                 if self.is_notified() {
                     self.listener.notify.sub_parkers(1, Ordering::Relaxed);
