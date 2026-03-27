@@ -35,6 +35,16 @@ impl<T> Lock<T, DefaultParkStrategy> {
     }
 }
 
+impl<T, P> Default for Lock<T, P>
+where
+    T: Default,
+    P: ParkStrategy,
+{
+    fn default() -> Self {
+        Self::with_park_strategy(T::default())
+    }
+}
+
 impl<T, P: ParkStrategy> Lock<T, P> {
     pub fn with_park_strategy(data: T) -> Self {
         Self {
