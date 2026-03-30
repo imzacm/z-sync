@@ -170,7 +170,8 @@ impl<T, P: ParkStrategy> Lock<T, P> {
             }
         }
 
-        #[cfg(feature = "std")]
+        // x86 seems to perform better without yielding.
+        #[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
         for _ in 0..SPIN_YIELD_MAX {
             let state = self.load_state(Ordering::Relaxed);
             if !state.has_any_write_state()
@@ -235,7 +236,8 @@ impl<T, P: ParkStrategy> Lock<T, P> {
             }
         }
 
-        #[cfg(feature = "std")]
+        // x86 seems to perform better without yielding.
+        #[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
         for _ in 0..SPIN_YIELD_MAX {
             let state = self.load_state(Ordering::Relaxed);
             if !state.has_readers_or_writers()
