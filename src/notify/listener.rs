@@ -85,7 +85,7 @@ impl<'a> Future for NotifyListener<'a> {
 
         // This creates a memory barrier, so even if we don't need the lock (early return), skipping
         // the lock can cause deadlocks (rare).
-        let mut queue = this.notify.async_wakers.lock();
+        let mut queue = this.notify.get_async_wakers().lock();
 
         if this.is_notified() {
             // We already hold the lock, clean up now so Drop doesn't have to re-lock.
@@ -133,7 +133,7 @@ impl<'a> Future for NotifyListener<'a> {
 impl<'a, P: ParkStrategy> Drop for NotifyListener<'a, P> {
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
-            && self.notify.async_wakers.lock().remove(ticket)
+            && self.notify.get_async_wakers().lock().remove(ticket)
         {
             self.notify.sub_wakers(1, Ordering::Relaxed);
         }

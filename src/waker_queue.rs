@@ -6,8 +6,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 use std::mem::MaybeUninit;
 
-use crossbeam_utils::CachePadded;
-
 /// Allow creating in const functions.
 #[cfg_attr(feature = "thin-vec", derive(Debug))]
 #[cfg(feature = "thin-vec")]
@@ -140,7 +138,7 @@ impl<const ARRAY_CAPACITY: usize> WakerQueue<ARRAY_CAPACITY> {
         );
 
         let mut nodes_array: [MaybeUninit<WakerNode>; ARRAY_CAPACITY] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+            [const { MaybeUninit::uninit() }; ARRAY_CAPACITY];
         let mut index = 0;
         while index < ARRAY_CAPACITY {
             let next = if index == ARRAY_CAPACITY - 1 {
@@ -295,7 +293,7 @@ impl<const ARRAY_CAPACITY: usize> WakerQueue<ARRAY_CAPACITY> {
 /// An exponential backoff spinlock tailored for microscopic critical sections.
 #[derive(Debug)]
 pub struct WakerQueueLock<const CAP: usize> {
-    locked: CachePadded<AtomicBool>,
+    locked: AtomicBool,
     queue: UnsafeCell<WakerQueue<CAP>>,
 }
 
@@ -312,7 +310,7 @@ impl<const CAP: usize> Default for WakerQueueLock<CAP> {
 impl<const CAP: usize> WakerQueueLock<CAP> {
     pub const fn new() -> Self {
         Self {
-            locked: CachePadded::new(AtomicBool::new(false)),
+            locked: AtomicBool::new(false),
             queue: UnsafeCell::new(WakerQueue::new()),
         }
     }

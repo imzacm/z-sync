@@ -1,11 +1,10 @@
 mod listener;
 mod select;
 
+use alloc::boxed::Box;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use core::task::Waker;
-
-use crossbeam_utils::CachePadded;
 
 pub use self::listener::NotifyListener;
 pub use self::select::select_blocking;
@@ -30,8 +29,8 @@ pub struct Notify<P = DefaultParkStrategy> {
     /// - 0..16: async wakers count (u16)
     /// - 16..32: parked threads count (u16)
     /// - 32..64: epoch (u32)
-    state: CachePadded<AtomicU64>,
-    async_wakers: WakerQueueLock<ASYNC_CAPACITY>,
+    state: AtomicU64,
+    async_wakers: AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
 }
 
 impl<P: ParkStrategy> Default for Notify<P> {
@@ -50,8 +49,37 @@ impl<P: ParkStrategy> Notify<P> {
     pub const fn with_park_strategy() -> Self {
         Self {
             _marker: core::marker::PhantomData,
-            state: CachePadded::new(AtomicU64::new(0)),
-            async_wakers: WakerQueueLock::new(),
+            state: AtomicU64::new(0),
+            async_wakers: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    #[cold]
+    fn init_waker_queue(
+        ptr: &AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
+    ) -> &WakerQueueLock<ASYNC_CAPACITY> {
+        let queue = Box::into_raw(Box::new(WakerQueueLock::new()));
+        match ptr.compare_exchange(
+            core::ptr::null_mut(),
+            queue,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => unsafe { &*queue },
+            Err(existing) => {
+                unsafe { drop(Box::from_raw(queue)) };
+                unsafe { &*existing }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn get_async_wakers(&self) -> &WakerQueueLock<ASYNC_CAPACITY> {
+        let ptr = self.async_wakers.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            unsafe { &*ptr }
+        } else {
+            Self::init_waker_queue(&self.async_wakers)
         }
     }
 
@@ -135,7 +163,7 @@ impl<P: ParkStrategy> Notify<P> {
                 [const { MaybeUninit::uninit() }; BATCH_SIZE];
 
             {
-                let mut queue = self.async_wakers.lock();
+                let mut queue = self.get_async_wakers().lock();
                 while remaining > 0 && popped < BATCH_SIZE {
                     let Some(waker) = queue.pop_and_take() else { break };
                     wakers[popped].write(waker);

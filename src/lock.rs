@@ -1,16 +1,28 @@
-use core::sync::atomic::{AtomicU64, Ordering};
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::ops::{Deref, DerefMut};
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
-
-use crossbeam_utils::CachePadded;
+use alloc::boxed::Box;
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::ops::{Deref, DerefMut};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 use crate::waker_queue::{WakerQueueLock, WakerTicket};
 
 const ASYNC_CAPACITY: usize = 4;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const SPIN_MAX: usize = 64;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const SPIN_CAP: usize = 32;
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+const SPIN_MAX: usize = 32;
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+const SPIN_CAP: usize = 16;
+
+#[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
+const SPIN_YIELD_MAX: usize = 8;
 
 /// An efficient multi-purpose blocking and async lock supporting Mutex and RwLock style usage.
 #[derive(Debug)]
@@ -23,14 +35,14 @@ pub struct Lock<T, P = DefaultParkStrategy> {
     /// - 32..40:  write parked threads count (u8)
     /// - 40..48:  writer count (u8)
     /// - 48..64:  readers count (u16)
-    state: CachePadded<AtomicU64>,
-    read_wakers: WakerQueueLock<ASYNC_CAPACITY>,
-    write_wakers: WakerQueueLock<ASYNC_CAPACITY>,
-    data: CachePadded<UnsafeCell<T>>,
+    state: AtomicU64,
+    data: UnsafeCell<T>,
+    read_wakers: AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
+    write_wakers: AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
 }
 
 impl<T> Lock<T, DefaultParkStrategy> {
-    pub fn new(data: T) -> Self {
+    pub const fn new(data: T) -> Self {
         Self::with_park_strategy(data)
     }
 }
@@ -46,17 +58,68 @@ where
 }
 
 impl<T, P: ParkStrategy> Lock<T, P> {
-    pub fn with_park_strategy(data: T) -> Self {
+    pub const fn with_park_strategy(data: T) -> Self {
         Self {
             _marker: core::marker::PhantomData,
-            state: CachePadded::new(AtomicU64::new(0)),
-            read_wakers: WakerQueueLock::new(),
-            write_wakers: WakerQueueLock::new(),
-            data: CachePadded::new(UnsafeCell::new(data)),
+            state: AtomicU64::new(0),
+            data: UnsafeCell::new(data),
+            read_wakers: AtomicPtr::new(core::ptr::null_mut()),
+            write_wakers: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
+    #[cold]
+    fn init_waker_queue(
+        ptr: &AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
+    ) -> &WakerQueueLock<ASYNC_CAPACITY> {
+        let queue = Box::into_raw(Box::new(WakerQueueLock::new()));
+        match ptr.compare_exchange(
+            core::ptr::null_mut(),
+            queue,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => unsafe { &*queue },
+            Err(existing) => {
+                unsafe { drop(Box::from_raw(queue)) };
+                unsafe { &*existing }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn get_read_wakers(&self) -> &WakerQueueLock<ASYNC_CAPACITY> {
+        let ptr = self.read_wakers.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            unsafe { &*ptr }
+        } else {
+            Self::init_waker_queue(&self.read_wakers)
+        }
+    }
+
+    #[inline(always)]
+    fn get_write_wakers(&self) -> &WakerQueueLock<ASYNC_CAPACITY> {
+        let ptr = self.write_wakers.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            unsafe { &*ptr }
+        } else {
+            Self::init_waker_queue(&self.write_wakers)
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn try_read(&self) -> Option<ReadGuard<'_, T, P>> {
+        self.try_read_for_async()
+    }
+
+    fn try_read_for_async(&self) -> Option<ReadGuard<'_, T, P>> {
+        // Fast test: Don't dirty the cache line if a writer is waiting/active.
+        if cfg!(not(any(target_arch = "x86", target_arch = "x86_64")))
+            && self.load_state(Ordering::Relaxed).has_any_write_state()
+        {
+            return None;
+        }
+
         let old_state = self.add_reader(Ordering::Acquire);
         // This will drop on None, so we don't need to worry about it.
         let guard = ReadGuard { lock: self };
@@ -68,9 +131,30 @@ impl<T, P: ParkStrategy> Lock<T, P> {
         Some(guard)
     }
 
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    pub fn try_read(&self) -> Option<ReadGuard<'_, T, P>> {
+        let mut state = self.load_state(Ordering::Relaxed);
+
+        loop {
+            if state.has_any_write_state() {
+                return None;
+            }
+
+            match self.state.compare_exchange_weak(
+                state.0,
+                state.add_reader().0,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(ReadGuard { lock: self }),
+                Err(actual) => state = LockState(actual),
+            }
+        }
+    }
+
     fn spin_try_read(&self) -> Option<ReadGuard<'_, T, P>> {
         let mut backoff = 1;
-        for _ in 0..64 {
+        for _ in 0..SPIN_MAX {
             let state = self.load_state(Ordering::Relaxed);
 
             if !state.has_any_write_state()
@@ -81,10 +165,22 @@ impl<T, P: ParkStrategy> Lock<T, P> {
             for _ in 0..backoff {
                 core::hint::spin_loop();
             }
-            if backoff < 32 {
+            if backoff < SPIN_CAP {
                 backoff <<= 1;
             }
         }
+
+        #[cfg(feature = "std")]
+        for _ in 0..SPIN_YIELD_MAX {
+            let state = self.load_state(Ordering::Relaxed);
+            if !state.has_any_write_state()
+                && let Some(guard) = self.try_read()
+            {
+                return Some(guard);
+            }
+            std::thread::yield_now();
+        }
+
         None
     }
 
@@ -122,7 +218,7 @@ impl<T, P: ParkStrategy> Lock<T, P> {
 
     fn spin_try_write(&self) -> Option<WriteGuard<'_, T, P>> {
         let mut backoff = 1;
-        for _ in 0..64 {
+        for _ in 0..SPIN_MAX {
             let state = self.load_state(Ordering::Relaxed);
 
             if !state.has_readers_or_writers()
@@ -134,18 +230,36 @@ impl<T, P: ParkStrategy> Lock<T, P> {
             for _ in 0..backoff {
                 core::hint::spin_loop();
             }
-            if backoff < 32 {
+            if backoff < SPIN_CAP {
                 backoff <<= 1;
             }
         }
+
+        #[cfg(feature = "std")]
+        for _ in 0..SPIN_YIELD_MAX {
+            let state = self.load_state(Ordering::Relaxed);
+            if !state.has_readers_or_writers()
+                && let Some(guard) = self.try_write()
+            {
+                return Some(guard);
+            }
+            std::thread::yield_now();
+        }
+
         None
     }
 
+    #[inline(always)]
     pub fn read(&self) -> ReadGuard<'_, T, P> {
         if let Some(guard) = self.try_read() {
             return guard;
         }
+        self.read_slow()
+    }
 
+    #[cold]
+    #[inline(never)]
+    fn read_slow(&self) -> ReadGuard<'_, T, P> {
         if let Some(guard) = self.spin_try_read() {
             return guard;
         }
@@ -165,11 +279,17 @@ impl<T, P: ParkStrategy> Lock<T, P> {
         }
     }
 
+    #[inline(always)]
     pub fn write(&self) -> WriteGuard<'_, T, P> {
         if let Some(guard) = self.try_write() {
             return guard;
         }
+        self.write_slow()
+    }
 
+    #[cold]
+    #[inline(never)]
+    fn write_slow(&self) -> WriteGuard<'_, T, P> {
         if let Some(guard) = self.spin_try_write() {
             return guard;
         }
@@ -199,6 +319,7 @@ impl<T, P: ParkStrategy> Lock<T, P> {
         WriteFuture { lock: self, waker_node_ticket: None }
     }
 
+    #[inline(always)]
     fn common_dropped<const IS_READER: bool>(&self) {
         let state = if IS_READER {
             self.sub_reader(Ordering::Release).sub_reader()
@@ -206,10 +327,16 @@ impl<T, P: ParkStrategy> Lock<T, P> {
             self.sub_writer(Ordering::Release).sub_writer()
         };
 
-        if state.has_readers_or_writers() {
+        if state.has_readers_or_writers() || !state.has_any_waiters() {
             return;
         }
 
+        self.common_dropped_slow(state);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn common_dropped_slow(&self, state: LockState) {
         if state.has_write_waiters() {
             if state.write_wakers() > 0 {
                 self.wake_one_in_queue::<false>();
@@ -227,7 +354,7 @@ impl<T, P: ParkStrategy> Lock<T, P> {
     }
 
     fn wake_one_in_queue<const IS_READER: bool>(&self) {
-        let queue = if IS_READER { &self.read_wakers } else { &self.write_wakers };
+        let queue = if IS_READER { self.get_read_wakers() } else { self.get_write_wakers() };
 
         let waker = queue.lock().pop_and_take();
         if let Some(waker) = waker {
@@ -243,7 +370,7 @@ impl<T, P: ParkStrategy> Lock<T, P> {
     fn wake_all_in_queue<const IS_READER: bool>(&self) {
         const BATCH_SIZE: usize = 32;
 
-        let queue = if IS_READER { &self.read_wakers } else { &self.write_wakers };
+        let queue = if IS_READER { self.get_read_wakers() } else { self.get_write_wakers() };
 
         let mut batch_sub = BatchStateSub::new();
 
@@ -303,6 +430,9 @@ impl<T, P> Lock<T, P> {
 
     // Bits 23..0 (24 bits): Covers Read Wakers and Read Parked
     const READ_WAITERS_MASK: u64 = 0x0000_0000_00FF_FFFF;
+
+    // Bits 39..0 (40 bits): Covers all waiters and parked.
+    const ANY_WAITERS_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
 
     #[inline(always)]
     fn add_read_waker(&self, ordering: Ordering) -> LockState {
@@ -371,17 +501,31 @@ impl<T, P> Lock<T, P> {
 
     #[inline(always)]
     fn reader_parking_key(&self) -> usize {
-        core::ptr::from_ref(&self.read_wakers) as usize
+        core::ptr::from_ref(self) as usize
     }
 
     #[inline(always)]
     fn writer_parking_key(&self) -> usize {
-        core::ptr::from_ref(&self.write_wakers) as usize
+        self.reader_parking_key() | 1
     }
 }
 
 unsafe impl<T: Send> Send for Lock<T> {}
 unsafe impl<T: Send> Sync for Lock<T> {}
+
+impl<T, P> Drop for Lock<T, P> {
+    fn drop(&mut self) {
+        let read_wakers = self.read_wakers.load(Ordering::Relaxed);
+        if !read_wakers.is_null() {
+            unsafe { drop(Box::from_raw(read_wakers)) };
+        }
+
+        let write_wakers = self.write_wakers.load(Ordering::Relaxed);
+        if !write_wakers.is_null() {
+            unsafe { drop(Box::from_raw(write_wakers)) };
+        }
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct LockState(u64);
@@ -496,6 +640,11 @@ impl LockState {
     pub const fn has_read_waiters(self) -> bool {
         (self.0 & Lock::<()>::READ_WAITERS_MASK) != 0
     }
+
+    #[inline(always)]
+    pub const fn has_any_waiters(self) -> bool {
+        (self.0 & Lock::<()>::ANY_WAITERS_MASK) != 0
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -587,9 +736,9 @@ impl<'a, T, P: ParkStrategy> Future for ReadFuture<'a, T, P> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
 
-        if let Some(guard) = this.lock.try_read() {
+        if let Some(guard) = this.lock.try_read_for_async() {
             if let Some(ticket) = this.waker_node_ticket.take()
-                && this.lock.read_wakers.lock().remove(ticket)
+                && this.lock.get_read_wakers().lock().remove(ticket)
             {
                 this.lock.sub_read_waker(Ordering::Relaxed);
             }
@@ -597,7 +746,7 @@ impl<'a, T, P: ParkStrategy> Future for ReadFuture<'a, T, P> {
         }
 
         {
-            let mut queue = this.lock.read_wakers.lock();
+            let mut queue = this.lock.get_read_wakers().lock();
 
             if let Some(ticket) = this.waker_node_ticket {
                 let node = queue.node_mut(ticket.index());
@@ -616,9 +765,9 @@ impl<'a, T, P: ParkStrategy> Future for ReadFuture<'a, T, P> {
             }
         }
 
-        if let Some(guard) = this.lock.try_read() {
+        if let Some(guard) = this.lock.try_read_for_async() {
             if let Some(ticket) = this.waker_node_ticket.take()
-                && this.lock.read_wakers.lock().remove(ticket)
+                && this.lock.get_read_wakers().lock().remove(ticket)
             {
                 this.lock.sub_read_waker(Ordering::Relaxed);
             }
@@ -632,7 +781,7 @@ impl<'a, T, P: ParkStrategy> Future for ReadFuture<'a, T, P> {
 impl<T, P: ParkStrategy> Drop for ReadFuture<'_, T, P> {
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
-            && self.lock.read_wakers.lock().remove(ticket)
+            && self.lock.get_read_wakers().lock().remove(ticket)
         {
             self.lock.sub_read_waker(Ordering::Relaxed);
         }
@@ -653,7 +802,7 @@ impl<'a, T, P: ParkStrategy> Future for WriteFuture<'a, T, P> {
 
         if let Some(guard) = this.lock.try_write() {
             if let Some(ticket) = this.waker_node_ticket.take()
-                && this.lock.write_wakers.lock().remove(ticket)
+                && this.lock.get_write_wakers().lock().remove(ticket)
             {
                 this.lock.sub_write_waker(Ordering::Relaxed);
             }
@@ -661,7 +810,7 @@ impl<'a, T, P: ParkStrategy> Future for WriteFuture<'a, T, P> {
         }
 
         {
-            let mut queue = this.lock.write_wakers.lock();
+            let mut queue = this.lock.get_write_wakers().lock();
 
             if let Some(guard) = this.lock.try_write() {
                 if let Some(ticket) = this.waker_node_ticket.take()
@@ -691,7 +840,7 @@ impl<'a, T, P: ParkStrategy> Future for WriteFuture<'a, T, P> {
 
         if let Some(guard) = this.lock.try_write() {
             if let Some(ticket) = this.waker_node_ticket.take()
-                && this.lock.write_wakers.lock().remove(ticket)
+                && this.lock.get_write_wakers().lock().remove(ticket)
             {
                 this.lock.sub_write_waker(Ordering::Relaxed);
             }
@@ -705,7 +854,7 @@ impl<'a, T, P: ParkStrategy> Future for WriteFuture<'a, T, P> {
 impl<T, P: ParkStrategy> Drop for WriteFuture<'_, T, P> {
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
-            && self.lock.write_wakers.lock().remove(ticket)
+            && self.lock.get_write_wakers().lock().remove(ticket)
         {
             self.lock.sub_write_waker(Ordering::Relaxed);
         }
