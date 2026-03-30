@@ -10,52 +10,31 @@ use std::mem::MaybeUninit;
 #[cfg_attr(feature = "thin-vec", derive(Debug))]
 #[cfg(feature = "thin-vec")]
 struct Vec<T> {
-    inner: core::cell::OnceCell<thin_vec::ThinVec<T>>,
+    inner: core::cell::LazyCell<thin_vec::ThinVec<T>>,
 }
 
 #[cfg(feature = "thin-vec")]
 impl<T> Vec<T> {
     const fn new() -> Self {
-        Self { inner: core::cell::OnceCell::new() }
-    }
-
-    #[inline(always)]
-    fn get_ref(&self) -> &thin_vec::ThinVec<T> {
-        self.inner.get_or_init(thin_vec::ThinVec::new)
-    }
-
-    #[inline(always)]
-    fn get_mut(&mut self) -> &mut thin_vec::ThinVec<T> {
-        self.get_ref();
-        unsafe { self.inner.get_mut().unwrap_unchecked() }
-    }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.get_ref().len()
-    }
-
-    #[inline(always)]
-    fn push(&mut self, value: T) {
-        self.get_mut().push(value);
+        Self { inner: core::cell::LazyCell::new(thin_vec::ThinVec::new) }
     }
 }
 
 #[cfg(feature = "thin-vec")]
-impl<T> core::ops::Index<usize> for Vec<T> {
-    type Output = T;
+impl<T> core::ops::Deref for Vec<T> {
+    type Target = thin_vec::ThinVec<T>;
 
     #[inline(always)]
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.get_ref()[index]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
 #[cfg(feature = "thin-vec")]
-impl<T> core::ops::IndexMut<usize> for Vec<T> {
+impl<T> core::ops::DerefMut for Vec<T> {
     #[inline(always)]
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.get_mut()[index]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -166,38 +145,46 @@ impl<const ARRAY_CAPACITY: usize> WakerQueue<ARRAY_CAPACITY> {
     /// Helper to seamlessly index into either the inline array or the fallback vector.
     #[inline(always)]
     pub fn node_mut(&mut self, index: u16) -> &mut WakerNode {
+        unsafe { &mut *self.node_mut_ptr(index) }
+    }
+
+    #[inline(always)]
+    pub fn node_mut_ptr(&mut self, index: u16) -> *mut WakerNode {
         let index = index as usize;
         if index < ARRAY_CAPACITY {
             unsafe { self.nodes_array.get_unchecked_mut(index) }
         } else {
-            &mut self.nodes_vec[index - ARRAY_CAPACITY]
+            debug_assert!((index - ARRAY_CAPACITY) < self.nodes_vec.len(), "index out of bounds");
+            unsafe { self.nodes_vec.as_mut_ptr().add(index - ARRAY_CAPACITY) }
         }
     }
 
     /// Pushes a waker to the back of the queue. Returns an (index, generation) ticket.
     pub fn push(&mut self, waker: Waker) -> WakerTicket {
-        // 1. Claim a free slot or allocate a new one in the vector
-        let index = if self.free_head != WakerNode::NULL_NODE {
-            let index = self.free_head;
-            self.free_head = self.node_mut(index).next;
-            index
-        } else {
-            let index = (ARRAY_CAPACITY + self.nodes_vec.len()) as u16;
-            self.nodes_vec.push(WakerNode::new(WakerNode::NULL_NODE, WakerNode::NULL_NODE));
-            index
-        };
-
-        // 2. Initialize the claimed node (tightly scoped for borrow checker)
-        let generation = {
+        let (index, generation) = {
             let tail = self.tail;
-            let node = self.node_mut(index);
-            node.waker = Some(waker);
-            node.prev = tail;
-            node.next = WakerNode::NULL_NODE;
-            node.generation
+            if self.free_head != WakerNode::NULL_NODE {
+                let index = self.free_head;
+                // Use ptr so we aren't mutably borrowing the whole of self.
+                let old_node = unsafe { &mut *self.node_mut_ptr(index) };
+                self.free_head = old_node.next;
+
+                old_node.waker = Some(waker);
+                old_node.prev = tail;
+                old_node.next = WakerNode::NULL_NODE;
+
+                (index, old_node.generation)
+            } else {
+                let index = (ARRAY_CAPACITY + self.nodes_vec.len()) as u16;
+                let mut node = WakerNode::new(tail, WakerNode::NULL_NODE);
+                node.waker = Some(waker);
+                let generation = node.generation;
+                self.nodes_vec.push(node);
+                (index, generation)
+            }
         };
 
-        // 3. Link it into the active queue
+        // Link it into the active queue
         if self.tail != WakerNode::NULL_NODE {
             self.node_mut(self.tail).next = index;
         } else {
@@ -214,26 +201,28 @@ impl<const ARRAY_CAPACITY: usize> WakerQueue<ARRAY_CAPACITY> {
     pub fn remove(&mut self, ticket: WakerTicket) -> bool {
         let index = ticket.index();
 
-        // Scope the borrow to extract current state so we can mutate neighbors later
-        let (node_gen, prev, next) = {
-            let node = self.node_mut(index);
-            (node.generation, node.prev, node.next)
-        };
+        // Use ptr so we aren't mutably borrowing the whole of self.
+        let node = unsafe { &mut *self.node_mut_ptr(index) };
 
         // If generation mismatches, this slot was already popped and reused.
-        if node_gen != ticket.generation() {
+        if node.generation != ticket.generation() {
             return false;
         }
 
         // Invalidate the node
-        {
-            let node = self.node_mut(index);
-            node.generation = node.generation.wrapping_add(1);
-            node.waker = None;
-        }
+        node.generation = node.generation.wrapping_add(1);
+        node.waker = None;
+
+        let prev = node.prev;
+        let next = node.next;
+
+        // Push to free list immediately while we have the reference
+        // Note: This seamlessly chains free array slots AND free vector slots together
+        node.next = self.free_head;
+        self.free_head = index;
 
         // Unlink from neighbors
-        if prev != WakerNode::NULL_NODE {
+        if node.prev != WakerNode::NULL_NODE {
             self.node_mut(prev).next = next;
         } else {
             self.head = next;
@@ -243,15 +232,6 @@ impl<const ARRAY_CAPACITY: usize> WakerQueue<ARRAY_CAPACITY> {
             self.node_mut(next).prev = prev;
         } else {
             self.tail = prev;
-        }
-
-        // Push the slot back onto the free list
-        // Note: This seamlessly chains free array slots AND free vector slots together!
-        {
-            let head = self.free_head;
-            let node = self.node_mut(index);
-            node.next = head;
-            self.free_head = index;
         }
 
         true
@@ -268,8 +248,7 @@ impl<const ARRAY_CAPACITY: usize> WakerQueue<ARRAY_CAPACITY> {
             let free_head = self.free_head;
             let node = self.node_mut(index);
             node.generation = node.generation.wrapping_add(1);
-            let waker = node.waker.take();
-            let waker = unsafe { waker.unwrap_unchecked() };
+            let waker = node.waker.take().unwrap();
             let next = node.next;
 
             // Push directly to free list
@@ -334,6 +313,9 @@ impl<const CAP: usize> WakerQueueLock<CAP> {
                 }
                 if backoff < 64 {
                     backoff <<= 1; // Bitwise shift is microscopically faster than *= 2
+                } else if cfg!(not(any(target_arch = "x86", target_arch = "x86_64"))) {
+                    #[cfg(feature = "std")]
+                    std::thread::yield_now();
                 }
             }
 
