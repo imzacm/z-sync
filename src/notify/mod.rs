@@ -21,6 +21,10 @@ pub type Notify16<P = DefaultParkStrategy> = Notify<NotifyStateU16, P>;
 pub type Notify32<P = DefaultParkStrategy> = Notify<NotifyStateU32, P>;
 pub type Notify64<P = DefaultParkStrategy> = Notify<NotifyStateU64, P>;
 
+pub type Notify16Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU16, P>;
+pub type Notify32Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU32, P>;
+pub type Notify64Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU64, P>;
+
 /// A lightweight notification primitive supporting both blocking and async waiters.
 ///
 /// Designed as a drop-in replacement for `event_listener::Event`, optimised for

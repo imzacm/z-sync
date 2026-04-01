@@ -6,7 +6,8 @@ use num_traits::ConstOne;
 
 #[cfg(feature = "std")]
 pub use self::timeout::NotifyTimeoutListener;
-use super::{Notify, NotifyState, NotifyStateU32};
+use super::{Notify, NotifyState};
+use crate::NotifyStateU64;
 use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 use crate::waker_queue::WakerTicket;
 
@@ -16,7 +17,7 @@ use crate::waker_queue::WakerTicket;
 #[derive(Debug)]
 pub struct NotifyListener<
     'a,
-    S: NotifyState = NotifyStateU32,
+    S: NotifyState = NotifyStateU64,
     P: ParkStrategy = DefaultParkStrategy,
 > {
     notify: &'a Notify<S, P>,
