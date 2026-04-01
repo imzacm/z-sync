@@ -479,41 +479,6 @@ fn bench_blocking_mpsc(c: &mut Criterion) {
     const PRODUCERS: usize = 10;
     const ITERS_PER_PROD: usize = 100;
 
-    group.bench_function("z_sync::Notify16", |b| {
-        b.iter(|| {
-            let notify = Notify16::new();
-            let counter = AtomicUsize::new(0);
-
-            std::thread::scope(|s| {
-                // Consumer
-                s.spawn(|| {
-                    let mut total = 0;
-                    let target = PRODUCERS * ITERS_PER_PROD;
-                    while total < target {
-                        let l = notify.listener();
-                        let current = counter.load(Ordering::Acquire);
-                        if current > total {
-                            total = current;
-                        } else {
-                            l.wait();
-                            total = counter.load(Ordering::Acquire);
-                        }
-                    }
-                });
-
-                // Producers
-                for _ in 0..PRODUCERS {
-                    s.spawn(|| {
-                        for _ in 0..ITERS_PER_PROD {
-                            counter.fetch_add(1, Ordering::Release);
-                            notify.notify(1);
-                        }
-                    });
-                }
-            });
-        })
-    });
-
     group.bench_function("z_sync::Notify32", |b| {
         b.iter(|| {
             let notify = Notify32::new();
