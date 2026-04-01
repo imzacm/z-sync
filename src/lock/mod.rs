@@ -22,12 +22,16 @@ pub type Lock64<T, P = DefaultParkStrategy> = Lock<T, LockStateU64, P>;
 const ASYNC_CAPACITY: usize = 4;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const SPIN_MAX: usize = 64;
+const READ_SPIN_MAX: usize = 64;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const WRITE_SPIN_MAX: usize = 64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const SPIN_CAP: usize = 32;
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const SPIN_MAX: usize = 32;
+const READ_SPIN_MAX: usize = 16;
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+const WRITE_SPIN_MAX: usize = 32;
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 const SPIN_CAP: usize = 16;
 
@@ -125,12 +129,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
         }
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     pub fn try_read(&self) -> Option<ReadGuard<'_, T, S, P>> {
-        self.try_read_for_async()
-    }
-
-    fn try_read_for_async(&self) -> Option<ReadGuard<'_, T, S, P>> {
         // Fast test: Don't dirty the cache line if a writer is waiting/active.
         if cfg!(not(any(target_arch = "x86", target_arch = "x86_64")))
             && self.load_state(Ordering::Relaxed).has_any_write_state()
@@ -149,31 +148,9 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
         Some(guard)
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    pub fn try_read(&self) -> Option<ReadGuard<'_, T, S, P>> {
-        let mut state = self.load_state(Ordering::Relaxed);
-
-        loop {
-            if state.has_any_write_state() {
-                return None;
-            }
-
-            match S::atomic_compare_exchange_weak(
-                &self.state,
-                state,
-                state.add_reader_state(),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(ReadGuard { lock: self }),
-                Err(actual) => state = actual,
-            }
-        }
-    }
-
     fn spin_try_read(&self) -> Option<ReadGuard<'_, T, S, P>> {
         let mut backoff = 1;
-        for _ in 0..SPIN_MAX {
+        for _ in 0..READ_SPIN_MAX {
             let state = self.load_state(Ordering::Relaxed);
 
             if !state.has_any_write_state()
@@ -238,7 +215,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
 
     fn spin_try_write(&self) -> Option<WriteGuard<'_, T, S, P>> {
         let mut backoff = 1;
-        for _ in 0..SPIN_MAX {
+        for _ in 0..WRITE_SPIN_MAX {
             let state = self.load_state(Ordering::Relaxed);
 
             if !state.has_readers_or_writers()
@@ -586,7 +563,7 @@ impl<'a, T, S: LockState, P: ParkStrategy> Future for ReadFuture<'a, T, S, P> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
 
-        if let Some(guard) = this.lock.try_read_for_async() {
+        if let Some(guard) = this.lock.try_read() {
             if let Some(ticket) = this.waker_node_ticket.take()
                 && this.lock.get_read_wakers().lock().remove(ticket)
             {
@@ -615,7 +592,7 @@ impl<'a, T, S: LockState, P: ParkStrategy> Future for ReadFuture<'a, T, S, P> {
             }
         }
 
-        if let Some(guard) = this.lock.try_read_for_async() {
+        if let Some(guard) = this.lock.try_read() {
             if let Some(ticket) = this.waker_node_ticket.take()
                 && this.lock.get_read_wakers().lock().remove(ticket)
             {
