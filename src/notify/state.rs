@@ -7,7 +7,7 @@ pub trait NotifyState: Sized + Copy + Clone + PartialEq + Eq {
 
     type Wakers: Eq + Ord + NumCast + ConstZero + ConstOne;
     type Parked: Eq + Ord + NumCast + ConstZero + ConstOne;
-    type Epoch: core::fmt::Debug + Eq + Ord + NumCast;
+    type Epoch: core::fmt::Debug + Eq + Ord + NumCast + Unpin;
 
     const INITIAL_ATOMIC: Self::Atomic;
 
