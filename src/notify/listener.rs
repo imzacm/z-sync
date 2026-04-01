@@ -2,9 +2,11 @@ use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll};
 
+use num_traits::ConstOne;
+
 #[cfg(feature = "std")]
 pub use self::timeout::NotifyTimeoutListener;
-use super::Notify;
+use super::{Notify, NotifyState, NotifyStateU32};
 use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 use crate::waker_queue::WakerTicket;
 
@@ -12,25 +14,29 @@ use crate::waker_queue::WakerTicket;
 ///
 /// Supports both blocking (`.wait()`) and async (`.await`) usage.
 #[derive(Debug)]
-pub struct NotifyListener<'a, P: ParkStrategy = DefaultParkStrategy> {
-    notify: &'a Notify<P>,
+pub struct NotifyListener<
+    'a,
+    S: NotifyState = NotifyStateU32,
+    P: ParkStrategy = DefaultParkStrategy,
+> {
+    notify: &'a Notify<S, P>,
     /// The epoch snapshot taken when this listener was created.
-    epoch: u32,
+    epoch: S::Epoch,
     waker_node_ticket: Option<WakerTicket>,
 }
 
-impl<'a, P: ParkStrategy> NotifyListener<'a, P> {
-    pub(super) fn new(notify: &'a Notify<P>, epoch: u32) -> Self {
+impl<'a, S: NotifyState, P: ParkStrategy> NotifyListener<'a, S, P> {
+    pub(super) fn new(notify: &'a Notify<S, P>, epoch: S::Epoch) -> Self {
         Self { notify, epoch, waker_node_ticket: None }
     }
 
     #[inline(always)]
-    pub fn notification(&self) -> &'a Notify<P> {
+    pub fn notification(&self) -> &'a Notify<S, P> {
         self.notify
     }
 
     #[inline(always)]
-    pub fn is_notification(&self, notify: &Notify<P>) -> bool {
+    pub fn is_notification(&self, notify: &Notify<S, P>) -> bool {
         core::ptr::eq(self.notify, notify)
     }
 
@@ -41,7 +47,7 @@ impl<'a, P: ParkStrategy> NotifyListener<'a, P> {
     }
 
     #[cfg(feature = "std")]
-    pub fn with_timeout(self, timeout: std::time::Duration) -> NotifyTimeoutListener<'a, P> {
+    pub fn with_timeout(self, timeout: std::time::Duration) -> NotifyTimeoutListener<'a, S, P> {
         NotifyTimeoutListener::new(self, timeout)
     }
 
@@ -58,13 +64,13 @@ impl<'a, P: ParkStrategy> NotifyListener<'a, P> {
             core::hint::spin_loop();
         }
 
-        self.notify.add_parkers(1, Ordering::SeqCst);
+        self.notify.add_parkers(S::Parked::ONE, Ordering::SeqCst);
 
         loop {
             P::park(self.notify.parking_key(), || !self.is_notified());
 
             if self.is_notified() {
-                self.notify.sub_parkers(1, Ordering::Relaxed);
+                self.notify.sub_parkers(S::Parked::ONE, Ordering::Relaxed);
                 return;
             }
 
@@ -73,7 +79,10 @@ impl<'a, P: ParkStrategy> NotifyListener<'a, P> {
     }
 }
 
-impl<'a> Future for NotifyListener<'a> {
+impl<'a, S: NotifyState, P: ParkStrategy> Future for NotifyListener<'a, S, P>
+where
+    S::Epoch: Unpin,
+{
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -92,7 +101,7 @@ impl<'a> Future for NotifyListener<'a> {
             if let Some(ticket) = this.waker_node_ticket.take()
                 && queue.remove(ticket)
             {
-                self.notify.sub_wakers(1, Ordering::Relaxed);
+                self.notify.sub_wakers(S::Wakers::ONE, Ordering::Relaxed);
             }
 
             return Poll::Ready(());
@@ -109,19 +118,19 @@ impl<'a> Future for NotifyListener<'a> {
                 // Our slot was popped and recycled by a previous wakeup. We must re-enqueue
                 // ourselves to prevent a lost wakeup.
                 this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                this.notify.add_wakers(1, Ordering::SeqCst);
+                this.notify.add_wakers(S::Wakers::ONE, Ordering::SeqCst);
             }
         } else {
             // First time being polled.
             this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-            this.notify.add_wakers(1, Ordering::SeqCst);
+            this.notify.add_wakers(S::Wakers::ONE, Ordering::SeqCst);
         }
 
         if this.is_notified() {
             if let Some(ticket) = this.waker_node_ticket.take()
                 && queue.remove(ticket)
             {
-                self.notify.sub_wakers(1, Ordering::Relaxed);
+                self.notify.sub_wakers(S::Wakers::ONE, Ordering::Relaxed);
             }
             return Poll::Ready(());
         }
@@ -130,12 +139,12 @@ impl<'a> Future for NotifyListener<'a> {
     }
 }
 
-impl<'a, P: ParkStrategy> Drop for NotifyListener<'a, P> {
+impl<'a, S: NotifyState, P: ParkStrategy> Drop for NotifyListener<'a, S, P> {
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
             && self.notify.get_async_wakers().lock().remove(ticket)
         {
-            self.notify.sub_wakers(1, Ordering::Relaxed);
+            self.notify.sub_wakers(S::Wakers::ONE, Ordering::Relaxed);
         }
     }
 }
@@ -147,23 +156,23 @@ mod timeout {
     use super::*;
 
     #[derive(Debug)]
-    pub struct NotifyTimeoutListener<'a, P: ParkStrategy = DefaultParkStrategy> {
-        listener: NotifyListener<'a, P>,
+    pub struct NotifyTimeoutListener<'a, S: NotifyState, P: ParkStrategy = DefaultParkStrategy> {
+        listener: NotifyListener<'a, S, P>,
         timeout: Duration,
     }
 
-    impl<'a, P: ParkStrategy> NotifyTimeoutListener<'a, P> {
-        pub(super) fn new(listener: NotifyListener<'a, P>, timeout: Duration) -> Self {
+    impl<'a, S: NotifyState, P: ParkStrategy> NotifyTimeoutListener<'a, S, P> {
+        pub(super) fn new(listener: NotifyListener<'a, S, P>, timeout: Duration) -> Self {
             Self { listener, timeout }
         }
 
         #[inline(always)]
-        pub fn notification(&self) -> &'a Notify<P> {
+        pub fn notification(&self) -> &'a Notify<S, P> {
             self.listener.notification()
         }
 
         #[inline(always)]
-        pub fn is_notification(&self, notify: &Notify<P>) -> bool {
+        pub fn is_notification(&self, notify: &Notify<S, P>) -> bool {
             self.listener.is_notification(notify)
         }
 
@@ -208,7 +217,7 @@ mod timeout {
                 core::hint::spin_loop();
             }
 
-            self.listener.notify.add_parkers(1, Ordering::SeqCst);
+            self.listener.notify.add_parkers(S::Parked::ONE, Ordering::SeqCst);
 
             loop {
                 if std::time::Instant::now() >= timeout {
@@ -222,7 +231,7 @@ mod timeout {
                 );
 
                 if self.is_notified() {
-                    self.listener.notify.sub_parkers(1, Ordering::Relaxed);
+                    self.listener.notify.sub_parkers(S::Parked::ONE, Ordering::Relaxed);
                     return Ok(());
                 }
 

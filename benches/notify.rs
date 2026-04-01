@@ -5,14 +5,28 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use event_listener::{Event, Listener};
 use tokio::runtime::Runtime;
 use tokio::sync::Barrier as AsyncBarrier;
-use z_sync::notify::Notify;
+use z_sync::notify::{Notify16, Notify32, Notify64};
 
 /// 1. Uncontended notify (no listeners registered)
 fn bench_uncontended(c: &mut Criterion) {
     let mut group = c.benchmark_group("uncontended_notify");
 
-    group.bench_function("z_queue::Notify", |b| {
-        let notify = Notify::new();
+    group.bench_function("z_sync::Notify16", |b| {
+        let notify = Notify16::new();
+        b.iter(|| {
+            notify.notify(1);
+        })
+    });
+
+    group.bench_function("z_sync::Notify32", |b| {
+        let notify = Notify32::new();
+        b.iter(|| {
+            notify.notify(1);
+        })
+    });
+
+    group.bench_function("z_sync::Notify64", |b| {
+        let notify = Notify64::new();
         b.iter(|| {
             notify.notify(1);
         })
@@ -40,8 +54,26 @@ fn bench_uncontended(c: &mut Criterion) {
 fn bench_blocking_fast_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("blocking_fast_path");
 
-    group.bench_function("z_queue::Notify", |b| {
-        let notify = Notify::new();
+    group.bench_function("z_sync::Notify16", |b| {
+        let notify = Notify16::new();
+        b.iter(|| {
+            let listener = notify.listener();
+            notify.notify(1);
+            listener.wait();
+        })
+    });
+
+    group.bench_function("z_sync::Notify32", |b| {
+        let notify = Notify32::new();
+        b.iter(|| {
+            let listener = notify.listener();
+            notify.notify(1);
+            listener.wait();
+        })
+    });
+
+    group.bench_function("z_sync::Notify64", |b| {
+        let notify = Notify64::new();
         b.iter(|| {
             let listener = notify.listener();
             notify.notify(1);
@@ -66,8 +98,26 @@ fn bench_async_fast_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("async_fast_path");
     let rt = Runtime::new().unwrap();
 
-    group.bench_function("z_queue::Notify", |b| {
-        let notify = Notify::new();
+    group.bench_function("z_sync::Notify16", |b| {
+        let notify = Notify16::new();
+        b.to_async(&rt).iter(|| async {
+            let listener = notify.listener();
+            notify.notify(1);
+            listener.await;
+        })
+    });
+
+    group.bench_function("z_sync::Notify32", |b| {
+        let notify = Notify32::new();
+        b.to_async(&rt).iter(|| async {
+            let listener = notify.listener();
+            notify.notify(1);
+            listener.await;
+        })
+    });
+
+    group.bench_function("z_sync::Notify64", |b| {
+        let notify = Notify64::new();
         b.to_async(&rt).iter(|| async {
             let listener = notify.listener();
             notify.notify(1);
@@ -102,10 +152,110 @@ fn bench_async_ping_pong(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     const ITERS: usize = 100;
 
-    group.bench_function("z_queue::Notify", |b| {
+    group.bench_function("z_sync::Notify16", |b| {
         b.to_async(&rt).iter(|| async {
-            let n1 = Arc::new(Notify::new());
-            let n2 = Arc::new(Notify::new());
+            let n1 = Arc::new(Notify16::new());
+            let n2 = Arc::new(Notify16::new());
+            let turn = Arc::new(AtomicUsize::new(0));
+
+            let n1_clone = n1.clone();
+            let n2_clone = n2.clone();
+            let turn_clone = turn.clone();
+
+            let task = tokio::spawn(async move {
+                for i in 0..ITERS {
+                    let expected_turn = i * 2 + 1;
+                    loop {
+                        if turn_clone.load(Ordering::Acquire) == expected_turn {
+                            break;
+                        }
+                        let l = n2_clone.listener();
+                        if turn_clone.load(Ordering::Acquire) == expected_turn {
+                            break;
+                        }
+                        l.await;
+                    }
+
+                    turn_clone.store(i * 2 + 2, Ordering::Release);
+                    n1_clone.notify(1);
+                }
+            });
+
+            for i in 0..ITERS {
+                turn.store(i * 2 + 1, Ordering::Release);
+                n2.notify(1);
+
+                let expected_turn = i * 2 + 2;
+                loop {
+                    if turn.load(Ordering::Acquire) == expected_turn {
+                        break;
+                    }
+                    let l = n1.listener();
+                    if turn.load(Ordering::Acquire) == expected_turn {
+                        break;
+                    }
+                    l.await;
+                }
+            }
+
+            task.await.unwrap();
+        });
+    });
+
+    group.bench_function("z_sync::Notify32", |b| {
+        b.to_async(&rt).iter(|| async {
+            let n1 = Arc::new(Notify32::new());
+            let n2 = Arc::new(Notify32::new());
+            let turn = Arc::new(AtomicUsize::new(0));
+
+            let n1_clone = n1.clone();
+            let n2_clone = n2.clone();
+            let turn_clone = turn.clone();
+
+            let task = tokio::spawn(async move {
+                for i in 0..ITERS {
+                    let expected_turn = i * 2 + 1;
+                    loop {
+                        if turn_clone.load(Ordering::Acquire) == expected_turn {
+                            break;
+                        }
+                        let l = n2_clone.listener();
+                        if turn_clone.load(Ordering::Acquire) == expected_turn {
+                            break;
+                        }
+                        l.await;
+                    }
+
+                    turn_clone.store(i * 2 + 2, Ordering::Release);
+                    n1_clone.notify(1);
+                }
+            });
+
+            for i in 0..ITERS {
+                turn.store(i * 2 + 1, Ordering::Release);
+                n2.notify(1);
+
+                let expected_turn = i * 2 + 2;
+                loop {
+                    if turn.load(Ordering::Acquire) == expected_turn {
+                        break;
+                    }
+                    let l = n1.listener();
+                    if turn.load(Ordering::Acquire) == expected_turn {
+                        break;
+                    }
+                    l.await;
+                }
+            }
+
+            task.await.unwrap();
+        });
+    });
+
+    group.bench_function("z_sync::Notify64", |b| {
+        b.to_async(&rt).iter(|| async {
+            let n1 = Arc::new(Notify64::new());
+            let n2 = Arc::new(Notify64::new());
             let turn = Arc::new(AtomicUsize::new(0));
 
             let n1_clone = n1.clone();
@@ -262,9 +412,28 @@ fn bench_blocking_thundering_herd(c: &mut Criterion) {
     let mut group = c.benchmark_group("blocking_thundering_herd_10_threads");
     const THREADS: usize = 10;
 
-    group.bench_function("z_queue::Notify", |b| {
+    group.bench_function("z_sync::Notify32", |b| {
         b.iter(|| {
-            let notify = Notify::new();
+            let notify = Notify32::new();
+            let ready = Barrier::new(THREADS + 1);
+
+            std::thread::scope(|s| {
+                for _ in 0..THREADS {
+                    s.spawn(|| {
+                        let listener = notify.listener();
+                        ready.wait();
+                        listener.wait();
+                    });
+                }
+                ready.wait(); // Wait for all to register listeners
+                notify.notify(usize::MAX); // Wake all
+            });
+        })
+    });
+
+    group.bench_function("z_sync::Notify64", |b| {
+        b.iter(|| {
+            let notify = Notify64::new();
             let ready = Barrier::new(THREADS + 1);
 
             std::thread::scope(|s| {
@@ -310,10 +479,79 @@ fn bench_blocking_mpsc(c: &mut Criterion) {
     const PRODUCERS: usize = 10;
     const ITERS_PER_PROD: usize = 100;
 
-    group.bench_function("z_queue::Notify", |b| {
-        // ... (Keep existing z_queue implementation intact)
+    group.bench_function("z_sync::Notify16", |b| {
         b.iter(|| {
-            let notify = Notify::new();
+            let notify = Notify16::new();
+            let counter = AtomicUsize::new(0);
+
+            std::thread::scope(|s| {
+                // Consumer
+                s.spawn(|| {
+                    let mut total = 0;
+                    let target = PRODUCERS * ITERS_PER_PROD;
+                    while total < target {
+                        let l = notify.listener();
+                        let current = counter.load(Ordering::Acquire);
+                        if current > total {
+                            total = current;
+                        } else {
+                            l.wait();
+                            total = counter.load(Ordering::Acquire);
+                        }
+                    }
+                });
+
+                // Producers
+                for _ in 0..PRODUCERS {
+                    s.spawn(|| {
+                        for _ in 0..ITERS_PER_PROD {
+                            counter.fetch_add(1, Ordering::Release);
+                            notify.notify(1);
+                        }
+                    });
+                }
+            });
+        })
+    });
+
+    group.bench_function("z_sync::Notify32", |b| {
+        b.iter(|| {
+            let notify = Notify32::new();
+            let counter = AtomicUsize::new(0);
+
+            std::thread::scope(|s| {
+                // Consumer
+                s.spawn(|| {
+                    let mut total = 0;
+                    let target = PRODUCERS * ITERS_PER_PROD;
+                    while total < target {
+                        let l = notify.listener();
+                        let current = counter.load(Ordering::Acquire);
+                        if current > total {
+                            total = current;
+                        } else {
+                            l.wait();
+                            total = counter.load(Ordering::Acquire);
+                        }
+                    }
+                });
+
+                // Producers
+                for _ in 0..PRODUCERS {
+                    s.spawn(|| {
+                        for _ in 0..ITERS_PER_PROD {
+                            counter.fetch_add(1, Ordering::Release);
+                            notify.notify(1);
+                        }
+                    });
+                }
+            });
+        })
+    });
+
+    group.bench_function("z_sync::Notify64", |b| {
+        b.iter(|| {
+            let notify = Notify64::new();
             let counter = AtomicUsize::new(0);
 
             std::thread::scope(|s| {
@@ -391,9 +629,34 @@ fn bench_async_thundering_herd(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     const TASKS: usize = 100;
 
-    group.bench_function("z_queue::Notify", |b| {
+    group.bench_function("z_sync::Notify32", |b| {
         b.to_async(&rt).iter(|| async {
-            let notify = Arc::new(Notify::new());
+            let notify = Arc::new(Notify32::new());
+            let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
+            let mut handles = Vec::with_capacity(TASKS);
+
+            for _ in 0..TASKS {
+                let notify_clone = notify.clone();
+                let barrier_clone = barrier.clone();
+                handles.push(tokio::spawn(async move {
+                    let listener = notify_clone.listener();
+                    barrier_clone.wait().await;
+                    listener.await;
+                }));
+            }
+
+            barrier.wait().await; // Ensure all tasks are awaiting
+            notify.notify(usize::MAX);
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("z_sync::Notify64", |b| {
+        b.to_async(&rt).iter(|| async {
+            let notify = Arc::new(Notify64::new());
             let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
             let mut handles = Vec::with_capacity(TASKS);
 
@@ -476,11 +739,75 @@ fn bench_async_chain(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     const TASKS: usize = 50;
 
-    group.bench_function("z_queue::Notify", |b| {
+    group.bench_function("z_sync::Notify16", |b| {
         b.to_async(&rt).iter(|| async {
             let mut notifies = Vec::with_capacity(TASKS + 1);
             for _ in 0..=TASKS {
-                notifies.push(Arc::new(Notify::new()));
+                notifies.push(Arc::new(Notify16::new()));
+            }
+
+            let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
+            let mut handles = Vec::with_capacity(TASKS);
+
+            for i in 0..TASKS {
+                let wait_notify = notifies[i].clone();
+                let wake_notify = notifies[i + 1].clone();
+                let b = barrier.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let listener = wait_notify.listener();
+                    b.wait().await; // Synchronize setup
+                    listener.await;
+                    wake_notify.notify(1);
+                }));
+            }
+
+            barrier.wait().await;
+            notifies[0].notify(1); // Knock over the first domino
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("z_sync::Notify32", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut notifies = Vec::with_capacity(TASKS + 1);
+            for _ in 0..=TASKS {
+                notifies.push(Arc::new(Notify32::new()));
+            }
+
+            let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
+            let mut handles = Vec::with_capacity(TASKS);
+
+            for i in 0..TASKS {
+                let wait_notify = notifies[i].clone();
+                let wake_notify = notifies[i + 1].clone();
+                let b = barrier.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let listener = wait_notify.listener();
+                    b.wait().await; // Synchronize setup
+                    listener.await;
+                    wake_notify.notify(1);
+                }));
+            }
+
+            barrier.wait().await;
+            notifies[0].notify(1); // Knock over the first domino
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("z_sync::Notify64", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut notifies = Vec::with_capacity(TASKS + 1);
+            for _ in 0..=TASKS {
+                notifies.push(Arc::new(Notify64::new()));
             }
 
             let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));

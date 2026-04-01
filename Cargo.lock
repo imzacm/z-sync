@@ -758,8 +758,10 @@ dependencies = [
  "criterion",
  "crossbeam-utils",
  "event-listener",
+ "num-traits",
  "parking_lot",
  "parking_lot_core",
+ "pin-project-lite",
  "thin-vec",
  "tokio",
 ]

@@ -1,10 +1,10 @@
 #[cfg(not(feature = "thin-vec"))]
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
-use std::mem::MaybeUninit;
 
 /// Allow creating in const functions.
 #[cfg_attr(feature = "thin-vec", derive(Debug))]

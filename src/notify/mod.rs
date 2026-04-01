@@ -1,17 +1,25 @@
 mod listener;
 mod select;
+mod state;
 
 use alloc::boxed::Box;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, Ordering};
 use core::task::Waker;
+
+use num_traits::{ConstZero, NumCast};
 
 pub use self::listener::NotifyListener;
 pub use self::select::select_blocking;
+pub use self::state::*;
 use crate::park_strategy::{DefaultParkStrategy, FilterOp, ParkStrategy};
 use crate::waker_queue::WakerQueueLock;
 
 const ASYNC_CAPACITY: usize = 2;
+
+pub type Notify16<P = DefaultParkStrategy> = Notify<NotifyStateU16, P>;
+pub type Notify32<P = DefaultParkStrategy> = Notify<NotifyStateU32, P>;
+pub type Notify64<P = DefaultParkStrategy> = Notify<NotifyStateU64, P>;
 
 /// A lightweight notification primitive supporting both blocking and async waiters.
 ///
@@ -23,33 +31,33 @@ const ASYNC_CAPACITY: usize = 2;
 /// once the epoch has advanced past that snapshot, which means a notification
 /// was fired *after* the listener was registered.
 #[derive(Debug)]
-pub struct Notify<P = DefaultParkStrategy> {
+pub struct Notify<S: NotifyState, P = DefaultParkStrategy> {
     _marker: core::marker::PhantomData<P>,
     /// Bit layout:
     /// - 0..16: async wakers count (u16)
     /// - 16..32: parked threads count (u16)
     /// - 32..64: epoch (u32)
-    state: AtomicU64,
+    state: S::Atomic,
     async_wakers: AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
 }
 
-impl<P: ParkStrategy> Default for Notify<P> {
+impl<S: NotifyState, P: ParkStrategy> Default for Notify<S, P> {
     fn default() -> Self {
         Self::with_park_strategy()
     }
 }
 
-impl Notify<DefaultParkStrategy> {
+impl<S: NotifyState> Notify<S, DefaultParkStrategy> {
     pub const fn new() -> Self {
         Self::with_park_strategy()
     }
 }
 
-impl<P: ParkStrategy> Notify<P> {
+impl<S: NotifyState, P: ParkStrategy> Notify<S, P> {
     pub const fn with_park_strategy() -> Self {
         Self {
             _marker: core::marker::PhantomData,
-            state: AtomicU64::new(0),
+            state: S::INITIAL_ATOMIC,
             async_wakers: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -84,29 +92,33 @@ impl<P: ParkStrategy> Notify<P> {
     }
 
     #[inline(always)]
-    fn load_state(&self, ordering: Ordering) -> NotifyState {
-        let value = self.state.load(ordering);
-        NotifyState(value)
+    fn load_state(&self, ordering: Ordering) -> S {
+        S::atomic_load(&self.state, ordering)
     }
 
     #[inline(always)]
-    fn add_parkers(&self, n: u16, ordering: Ordering) {
-        self.state.fetch_add((n as u64) << 16, ordering);
+    pub fn has_listeners(&self) -> bool {
+        self.load_state(Ordering::Acquire).has_listeners()
     }
 
     #[inline(always)]
-    fn add_wakers(&self, n: u16, ordering: Ordering) {
-        self.state.fetch_add(n as u64, ordering);
+    fn add_parkers(&self, n: S::Parked, ordering: Ordering) {
+        S::atomic_add_parkers(&self.state, n, ordering);
     }
 
     #[inline(always)]
-    fn sub_parkers(&self, n: u16, ordering: Ordering) {
-        self.state.fetch_sub((n as u64) << 16, ordering);
+    fn add_wakers(&self, n: S::Wakers, ordering: Ordering) {
+        S::atomic_add_wakers(&self.state, n, ordering);
     }
 
     #[inline(always)]
-    fn sub_wakers(&self, n: u16, ordering: Ordering) {
-        self.state.fetch_sub(n as u64, ordering);
+    fn sub_parkers(&self, n: S::Parked, ordering: Ordering) {
+        S::atomic_sub_parkers(&self.state, n, ordering);
+    }
+
+    #[inline(always)]
+    fn sub_wakers(&self, n: S::Wakers, ordering: Ordering) {
+        S::atomic_sub_wakers(&self.state, n, ordering);
     }
 
     /// Creates a listener that captures the current epoch.
@@ -118,7 +130,7 @@ impl<P: ParkStrategy> Notify<P> {
     /// listener.wait();   // or  listener.await
     /// ```
     #[inline(always)]
-    pub fn listener(&self) -> NotifyListener<'_, P> {
+    pub fn listener(&self) -> NotifyListener<'_, S, P> {
         let epoch = self.load_state(Ordering::Acquire).epoch();
         NotifyListener::new(self, epoch)
     }
@@ -127,26 +139,32 @@ impl<P: ParkStrategy> Notify<P> {
     ///
     /// Semantics: advances the epoch, then wakes at most `n` waiters
     /// (a mix of async wakers and parked threads).
+    #[inline(always)]
     pub fn notify(&self, n: usize) {
         if n == 0 {
             return;
         }
 
         // Increment epoch and read counts at same time.
-        //
-        // Incrementing the epoch by 1 adds `1 << 32` to the underlying u64.
-        // This leaves the lower 32 bits (parked and wakers) perfectly intact.
-        let state = NotifyState(self.state.fetch_add(1 << 32, Ordering::Release));
+        let state = S::atomic_inc_epoch(&self.state, Ordering::Release);
 
+        if state.has_listeners() {
+            self.notify_cold(n, state);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn notify_cold(&self, n: usize, state: S) {
         let mut remaining = n;
 
         // Wake async waiters first (cheaper than syscalls).
-        if state.wakers() > 0 {
+        if state.wakers() > S::Wakers::ZERO {
             remaining = self.wake_async(remaining);
         }
 
         // Wake blocked threads only if any are actually parked.
-        if state.parked() > 0 && remaining > 0 {
+        if state.parked() > S::Parked::ZERO && remaining > 0 {
             self.wake_blocking(remaining);
         }
     }
@@ -176,7 +194,8 @@ impl<P: ParkStrategy> Notify<P> {
                 break;
             }
 
-            self.sub_wakers(popped as u16, Ordering::SeqCst);
+            let popped_wakers: S::Wakers = NumCast::from(popped).unwrap();
+            self.sub_wakers(popped_wakers, Ordering::SeqCst);
 
             for waker in &mut wakers[..popped] {
                 // SAFETY: We explicitly initialized exactly `popped` elements
@@ -225,26 +244,6 @@ impl<P: ParkStrategy> Notify<P> {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-struct NotifyState(u64);
-
-impl NotifyState {
-    #[inline(always)]
-    const fn epoch(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-
-    #[inline(always)]
-    const fn parked(self) -> u16 {
-        (self.0 >> 16) as u16
-    }
-
-    #[inline(always)]
-    const fn wakers(self) -> u16 {
-        self.0 as u16
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
@@ -253,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_async() {
-        let notify = Arc::new(Notify::new());
+        let notify = Arc::new(Notify32::new());
 
         let listener = notify.listener();
         assert!(!listener.is_notified());
@@ -275,8 +274,8 @@ mod tests {
     #[test]
     fn verify_struct_sizes() {
         assert_eq!(
-            size_of::<Notify<crate::park_strategy::ParkingLot>>(),
-            size_of::<Notify<crate::park_strategy::Spin>>()
+            size_of::<Notify32<crate::park_strategy::ParkingLot>>(),
+            size_of::<Notify32<crate::park_strategy::Spin>>()
         );
     }
 }
