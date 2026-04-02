@@ -6,13 +6,16 @@ use core::task::{Context, Poll};
 use crate::lock::{ReadFuture, ReadGuard, WriteFuture, WriteGuard};
 use crate::park_strategy::DefaultParkStrategy;
 use crate::{
-    Lock, LockState, LockStateU16, LockStateU32, LockStateU64, Notify, NotifyState, NotifyStateU32,
-    ParkStrategy,
+    Lock, LockState, LockStateU16, LockStateU32, LockStateU64, Notify, NotifyState, NotifyStateU16,
+    NotifyStateU32, NotifyStateU64, ParkStrategy,
 };
 
-pub type ObservableLock16<T, P = DefaultParkStrategy> = ObservableLock<T, LockStateU16, P>;
-pub type ObservableLock32<T, P = DefaultParkStrategy> = ObservableLock<T, LockStateU32, P>;
-pub type ObservableLock64<T, P = DefaultParkStrategy> = ObservableLock<T, LockStateU64, P>;
+pub type ObservableLock16<T, NS = NotifyStateU16, P = DefaultParkStrategy> =
+    ObservableLock<T, LockStateU16, NS, P>;
+pub type ObservableLock32<T, NS = NotifyStateU32, P = DefaultParkStrategy> =
+    ObservableLock<T, LockStateU32, NS, P>;
+pub type ObservableLock64<T, NS = NotifyStateU64, P = DefaultParkStrategy> =
+    ObservableLock<T, LockStateU64, NS, P>;
 
 /// Emits a notification when a write guard is dropped.
 #[derive(Debug)]
