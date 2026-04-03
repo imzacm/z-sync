@@ -506,6 +506,18 @@ pub struct ReadGuard<'a, T, S: LockState, P: ParkStrategy = DefaultParkStrategy>
     lock: &'a Lock<T, S, P>,
 }
 
+impl<'a, T, S: LockState, P: ParkStrategy> ReadGuard<'a, T, S, P> {
+    #[inline(always)]
+    pub fn map<U, F>(guard: ReadGuard<'a, T, S, P>, f: F) -> MappedReadGuard<'a, T, U, S, P>
+    where
+        F: FnOnce(&T) -> &U,
+        U: ?Sized,
+    {
+        let value = unsafe { &*guard.lock.data.get() };
+        MappedReadGuard { _guard: guard, value: f(value) }
+    }
+}
+
 impl<T, S: LockState, P: ParkStrategy> Drop for ReadGuard<'_, T, S, P> {
     fn drop(&mut self) {
         self.lock.common_dropped::<true>();
@@ -517,6 +529,20 @@ impl<T, S: LockState, P: ParkStrategy> Deref for ReadGuard<'_, T, S, P> {
 
     fn deref(&self) -> &T {
         unsafe { &*self.lock.data.get() }
+    }
+}
+
+#[derive(Debug)]
+pub struct MappedReadGuard<'a, T, U: ?Sized, S: LockState, P: ParkStrategy = DefaultParkStrategy> {
+    _guard: ReadGuard<'a, T, S, P>,
+    value: &'a U,
+}
+
+impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy> Deref for MappedReadGuard<'a, T, U, S, P> {
+    type Target = U;
+
+    fn deref(&self) -> &U {
+        self.value
     }
 }
 
