@@ -1,8 +1,10 @@
 mod listener;
+mod rc_listener;
 mod select;
 mod state;
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use core::task::Waker;
@@ -10,6 +12,7 @@ use core::task::Waker;
 use num_traits::{ConstZero, NumCast};
 
 pub use self::listener::NotifyListener;
+pub use self::rc_listener::NotifyRcListener;
 pub use self::select::select_blocking;
 pub use self::state::*;
 use crate::park_strategy::{DefaultParkStrategy, FilterOp, ParkStrategy};
@@ -137,6 +140,12 @@ impl<S: NotifyState, P: ParkStrategy> Notify<S, P> {
     pub fn listener(&self) -> NotifyListener<'_, S, P> {
         let epoch = self.load_state(Ordering::Acquire).epoch();
         NotifyListener::new(self, epoch)
+    }
+
+    #[inline(always)]
+    pub fn rc_listener(self: &Rc<Self>) -> NotifyRcListener<S, P> {
+        let epoch = self.load_state(Ordering::Acquire).epoch();
+        NotifyRcListener::new(Rc::clone(self), epoch)
     }
 
     /// Wake up to `n` waiting tasks/threads.
