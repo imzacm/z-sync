@@ -5,7 +5,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use event_listener::{Event, Listener};
 use tokio::runtime::Runtime;
 use tokio::sync::Barrier as AsyncBarrier;
-use z_sync::notify::{Notify16, Notify32, Notify64};
+use z_sync::notify::{Notify16, Notify32, Notify32Boxed, Notify64, Notify64Boxed};
 
 /// 1. Uncontended notify (no listeners registered)
 fn bench_uncontended(c: &mut Criterion) {
@@ -644,6 +644,56 @@ fn bench_async_thundering_herd(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("z_sync::Notify32Boxed", |b| {
+        b.to_async(&rt).iter(|| async {
+            let notify = Arc::new(Notify32Boxed::new());
+            let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
+            let mut handles = Vec::with_capacity(TASKS);
+
+            for _ in 0..TASKS {
+                let notify_clone = notify.clone();
+                let barrier_clone = barrier.clone();
+                handles.push(tokio::spawn(async move {
+                    let listener = notify_clone.listener();
+                    barrier_clone.wait().await;
+                    listener.await;
+                }));
+            }
+
+            barrier.wait().await; // Ensure all tasks are awaiting
+            notify.notify(usize::MAX);
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("z_sync::Notify64Boxed", |b| {
+        b.to_async(&rt).iter(|| async {
+            let notify = Arc::new(Notify64Boxed::new());
+            let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
+            let mut handles = Vec::with_capacity(TASKS);
+
+            for _ in 0..TASKS {
+                let notify_clone = notify.clone();
+                let barrier_clone = barrier.clone();
+                handles.push(tokio::spawn(async move {
+                    let listener = notify_clone.listener();
+                    barrier_clone.wait().await;
+                    listener.await;
+                }));
+            }
+
+            barrier.wait().await; // Ensure all tasks are awaiting
+            notify.notify(usize::MAX);
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+
     group.bench_function("event_listener::Event", |b| {
         b.to_async(&rt).iter(|| async {
             let event = Arc::new(Event::new());
@@ -773,6 +823,70 @@ fn bench_async_chain(c: &mut Criterion) {
             let mut notifies = Vec::with_capacity(TASKS + 1);
             for _ in 0..=TASKS {
                 notifies.push(Arc::new(Notify64::new()));
+            }
+
+            let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
+            let mut handles = Vec::with_capacity(TASKS);
+
+            for i in 0..TASKS {
+                let wait_notify = notifies[i].clone();
+                let wake_notify = notifies[i + 1].clone();
+                let b = barrier.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let listener = wait_notify.listener();
+                    b.wait().await; // Synchronize setup
+                    listener.await;
+                    wake_notify.notify(1);
+                }));
+            }
+
+            barrier.wait().await;
+            notifies[0].notify(1); // Knock over the first domino
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("z_sync::Notify32Boxed", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut notifies = Vec::with_capacity(TASKS + 1);
+            for _ in 0..=TASKS {
+                notifies.push(Arc::new(Notify32Boxed::new()));
+            }
+
+            let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
+            let mut handles = Vec::with_capacity(TASKS);
+
+            for i in 0..TASKS {
+                let wait_notify = notifies[i].clone();
+                let wake_notify = notifies[i + 1].clone();
+                let b = barrier.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let listener = wait_notify.listener();
+                    b.wait().await; // Synchronize setup
+                    listener.await;
+                    wake_notify.notify(1);
+                }));
+            }
+
+            barrier.wait().await;
+            notifies[0].notify(1); // Knock over the first domino
+
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+
+    group.bench_function("z_sync::Notify64Boxed", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut notifies = Vec::with_capacity(TASKS + 1);
+            for _ in 0..=TASKS {
+                notifies.push(Arc::new(Notify64Boxed::new()));
             }
 
             let barrier = Arc::new(AsyncBarrier::new(TASKS + 1));
