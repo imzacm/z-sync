@@ -28,9 +28,11 @@ crate offers a fast *both* in one place.
       per-slot `Lock` for concurrent reads. Benched vs `tokio` and `async-broadcast`.
     - ~~`mpsc` (bounded + unbounded)~~ — **won't do here.** A separate library builds
       `mpsc` / `mpmc` / `spsc` / `spmc` on top of these primitives.
-- [ ] **`Once` / `OnceCell` / `Lazy`** — one-time init with both `get_or_init` (blocking) and
-  `get_or_init_async`. `const fn` constructors + `Notify` epoch make the "wait for the other initialiser"
-  path cheap. Fills a `no_std` async gap `std::sync::OnceLock` can't cover.
+- [x] **`Once` / `OnceCell` / `Lazy`** — one-time init with both `get_or_init` (blocking) and
+  `get_or_init_async`, plus fallible `call_once_try` / `get_or_try_init` (`*_async` too) that leave the
+  primitive uninitialised on error so a later call retries (`std::sync::OnceLock` semantics, no poison).
+  `const fn` constructors; built on `Once` (`Notify`-backed wait). Fills a `no_std` async gap
+  `std::sync::OnceLock` can't cover.
 - [ ] **`Barrier`** — N-party rendezvous (`wait` / `wait_async`); a counter + `Notify` broadcast. One type
   covering both `std::sync::Barrier` and `tokio::sync::Barrier`.
 - [ ] **`WaitGroup` / `CountdownLatch`** — Go-style "wait until N units complete." Counter down to zero,
