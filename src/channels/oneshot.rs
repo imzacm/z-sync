@@ -1,15 +1,43 @@
 //! A one-shot channel: a single value sent from one [`Sender`] to one [`Receiver`].
 //!
-//! The channel state lives in a standalone [`OneShot`] that the caller owns and stores however they
-//! like (on the stack with scoped threads, in a `static`, behind their own `Arc`, ...). Call
-//! [`OneShot::split`] to obtain the borrowed [`Sender`]/[`Receiver`] halves. Wakeups reuse
-//! [`Notify`](crate::Notify), so the receiver can wait from blocking or async code.
+//! The channel state lives in a standalone [`OneShot`] that the caller owns. The `Sender`/`Receiver`
+//! halves are generic over the [`Holder`](crate::Holder) that keeps the channel alive:
+//! [`split`](OneShot::split) yields borrowed halves (`&OneShot`), while
+//! [`arc_split`](OneShot::arc_split) / [`rc_split`](OneShot::rc_split) /
+//! [`triomphe_arc_split`](OneShot::triomphe_arc_split) yield owned halves that can be moved into a
+//! spawned thread or task. Wakeups reuse [`Notify`](crate::Notify), so the receiver can wait from
+//! blocking or async code.
 
+use alloc::rc::Rc;
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::Notify32;
+#[cfg(feature = "triomphe-arc")]
+use triomphe::Arc as TriompheArc;
+
+use crate::{Holder, Notify32};
+
+/// A borrowed [`Sender`] (`&OneShot`).
+pub type RefSender<'a, T> = Sender<T, &'a OneShot<T>>;
+/// A borrowed [`Receiver`] (`&OneShot`).
+pub type RefReceiver<'a, T> = Receiver<T, &'a OneShot<T>>;
+/// An owned [`Sender`] backed by a std [`Arc`].
+pub type ArcSender<T> = Sender<T, Arc<OneShot<T>>>;
+/// An owned [`Receiver`] backed by a std [`Arc`].
+pub type ArcReceiver<T> = Receiver<T, Arc<OneShot<T>>>;
+/// An owned [`Sender`] backed by an [`Rc`].
+pub type RcSender<T> = Sender<T, Rc<OneShot<T>>>;
+/// An owned [`Receiver`] backed by an [`Rc`].
+pub type RcReceiver<T> = Receiver<T, Rc<OneShot<T>>>;
+/// An owned [`Sender`] backed by a `triomphe::Arc`.
+#[cfg(feature = "triomphe-arc")]
+pub type TriompheArcSender<T> = Sender<T, TriompheArc<OneShot<T>>>;
+/// An owned [`Receiver`] backed by a `triomphe::Arc`.
+#[cfg(feature = "triomphe-arc")]
+pub type TriompheArcReceiver<T> = Receiver<T, TriompheArc<OneShot<T>>>;
 
 const EMPTY: u8 = 0;
 /// The value has been written and is waiting to be taken.
@@ -62,12 +90,42 @@ impl<T> OneShot<T> {
         }
     }
 
-    /// Splits into the borrowed sender/receiver halves.
+    /// Splits into borrowed sender/receiver halves.
     ///
     /// Takes `&mut self` so the halves cannot be created more than once.
-    pub fn split(&mut self) -> (Sender<'_, T>, Receiver<'_, T>) {
-        let chan: &Self = self;
-        (Sender { chan }, Receiver { chan })
+    pub fn split(&mut self) -> (RefSender<'_, T>, RefReceiver<'_, T>) {
+        let channel: &Self = self;
+        (Sender { channel, _marker: PhantomData }, Receiver { channel, _marker: PhantomData })
+    }
+
+    /// Splits into owned halves backed by a std [`Arc`] (movable across threads/tasks).
+    pub fn arc_split(self: &Arc<Self>) -> (ArcSender<T>, ArcReceiver<T>) {
+        (
+            Sender { channel: Arc::clone(self), _marker: PhantomData },
+            Receiver { channel: Arc::clone(self), _marker: PhantomData },
+        )
+    }
+
+    /// Splits into owned halves backed by an [`Rc`] (single-threaded).
+    pub fn rc_split(self: &Rc<Self>) -> (RcSender<T>, RcReceiver<T>) {
+        (
+            Sender { channel: Rc::clone(self), _marker: PhantomData },
+            Receiver { channel: Rc::clone(self), _marker: PhantomData },
+        )
+    }
+
+    /// Splits into owned halves backed by a `triomphe::Arc`.
+    ///
+    /// A free-standing associated function (`OneShot::triomphe_arc_split(&arc)`) because
+    /// `triomphe::Arc` cannot be a `self` receiver on stable.
+    #[cfg(feature = "triomphe-arc")]
+    pub fn triomphe_arc_split(
+        this: &TriompheArc<Self>,
+    ) -> (TriompheArcSender<T>, TriompheArcReceiver<T>) {
+        (
+            Sender { channel: TriompheArc::clone(this), _marker: PhantomData },
+            Receiver { channel: TriompheArc::clone(this), _marker: PhantomData },
+        )
     }
 }
 
@@ -80,16 +138,20 @@ impl<T> Drop for OneShot<T> {
     }
 }
 
-/// The sending half of a [`OneShot`].
+/// The sending half of a [`OneShot`], generic over the [`Holder`] `H` (a `&OneShot`, `Arc`, `Rc`,
+/// ...). See the [`RefSender`] / [`ArcSender`] / [`RcSender`] aliases.
 #[derive(Debug)]
-pub struct Sender<'a, T> {
-    chan: &'a OneShot<T>,
+pub struct Sender<T, H: Holder<OneShot<T>> = Arc<OneShot<T>>> {
+    channel: H,
+    _marker: PhantomData<fn() -> T>,
 }
 
-/// The receiving half of a [`OneShot`].
+/// The receiving half of a [`OneShot`], generic over the [`Holder`] `H`. See the [`RefReceiver`] /
+/// [`ArcReceiver`] / [`RcReceiver`] aliases.
 #[derive(Debug)]
-pub struct Receiver<'a, T> {
-    chan: &'a OneShot<T>,
+pub struct Receiver<T, H: Holder<OneShot<T>> = Arc<OneShot<T>>> {
+    channel: H,
+    _marker: PhantomData<fn() -> T>,
 }
 
 impl<T> core::fmt::Debug for OneShot<T> {
@@ -98,26 +160,26 @@ impl<T> core::fmt::Debug for OneShot<T> {
     }
 }
 
-impl<T> Sender<'_, T> {
+impl<T, H: Holder<OneShot<T>>> Sender<T, H> {
     /// Sends `value`, consuming the sender.
     ///
     /// Returns `Err(value)` if the receiver has already been dropped.
     pub fn send(self, value: T) -> Result<(), T> {
         // Write the value before publishing `SENT`; the receiver reads it under Acquire.
-        unsafe { (*self.chan.value.get()).write(value) };
+        unsafe { (*self.channel.value.get()).write(value) };
 
         match self
-            .chan
+            .channel
             .state
             .compare_exchange(EMPTY, SENT, Ordering::Release, Ordering::Acquire)
         {
             Ok(_) => {
-                self.chan.notify.notify(1);
+                self.channel.notify.notify(1);
                 Ok(())
             }
             Err(_) => {
                 // The receiver is gone (RX_CLOSED). Reclaim the value we just wrote.
-                let value = unsafe { (*self.chan.value.get()).assume_init_read() };
+                let value = unsafe { (*self.channel.value.get()).assume_init_read() };
                 Err(value)
             }
         }
@@ -126,32 +188,32 @@ impl<T> Sender<'_, T> {
     /// Returns `true` if the receiver has been dropped, so [`send`](Sender::send) would fail.
     #[inline]
     pub fn is_closed(&self) -> bool {
-        self.chan.state.load(Ordering::Acquire) == RX_CLOSED
+        self.channel.state.load(Ordering::Acquire) == RX_CLOSED
     }
 }
 
-impl<T> Drop for Sender<'_, T> {
+impl<T, H: Holder<OneShot<T>>> Drop for Sender<T, H> {
     fn drop(&mut self) {
         // If we never sent, transition EMPTY→TX_CLOSED and wake the receiver. If a value was sent
         // (SENT) or the receiver already left (RX_CLOSED), the CAS fails and there is nothing to do.
         if self
-            .chan
+            .channel
             .state
             .compare_exchange(EMPTY, TX_CLOSED, Ordering::Release, Ordering::Relaxed)
             .is_ok()
         {
-            self.chan.notify.notify(1);
+            self.channel.notify.notify(1);
         }
     }
 }
 
-impl<T> Receiver<'_, T> {
+impl<T, H: Holder<OneShot<T>>> Receiver<T, H> {
     /// Reads the value if one is available or the sender has closed, without waiting.
     fn poll_value(&self) -> Option<Result<T, RecvError>> {
-        match self.chan.state.load(Ordering::Acquire) {
+        match self.channel.state.load(Ordering::Acquire) {
             SENT => {
-                let value = unsafe { (*self.chan.value.get()).assume_init_read() };
-                self.chan.state.store(TAKEN, Ordering::Release);
+                let value = unsafe { (*self.channel.value.get()).assume_init_read() };
+                self.channel.state.store(TAKEN, Ordering::Release);
                 Some(Ok(value))
             }
             TX_CLOSED => Some(Err(RecvError)),
@@ -174,7 +236,7 @@ impl<T> Receiver<'_, T> {
             if let Some(result) = self.poll_value() {
                 return result;
             }
-            let listener = self.chan.notify.listener();
+            let listener = self.channel.notify.listener();
             if let Some(result) = self.poll_value() {
                 return result;
             }
@@ -188,7 +250,7 @@ impl<T> Receiver<'_, T> {
             if let Some(result) = self.poll_value() {
                 return result;
             }
-            let listener = self.chan.notify.listener();
+            let listener = self.channel.notify.listener();
             if let Some(result) = self.poll_value() {
                 return result;
             }
@@ -197,11 +259,11 @@ impl<T> Receiver<'_, T> {
     }
 }
 
-impl<T> Drop for Receiver<'_, T> {
+impl<T, H: Holder<OneShot<T>>> Drop for Receiver<T, H> {
     fn drop(&mut self) {
         // Signal the sender that we are gone (only meaningful while still EMPTY). A SENT-but-untaken
         // value is left in place for `OneShot::drop` to clean up.
-        let _ = self.chan.state.compare_exchange(
+        let _ = self.channel.state.compare_exchange(
             EMPTY,
             RX_CLOSED,
             Ordering::Release,
@@ -220,16 +282,16 @@ mod tests {
 
     #[test]
     fn send_then_recv() {
-        let mut chan = OneShot::new();
-        let (tx, rx) = chan.split();
+        let mut channel = OneShot::new();
+        let (tx, rx) = channel.split();
         tx.send(42u32).unwrap();
         assert_eq!(rx.recv().unwrap(), 42);
     }
 
     #[test]
     fn try_recv_empty_then_value() {
-        let mut chan = OneShot::<u32>::new();
-        let (tx, rx) = chan.split();
+        let mut channel = OneShot::<u32>::new();
+        let (tx, rx) = channel.split();
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
         tx.send(7).unwrap();
         assert_eq!(rx.try_recv(), Ok(7));
@@ -237,24 +299,24 @@ mod tests {
 
     #[test]
     fn sender_dropped_without_send() {
-        let mut chan = OneShot::<u32>::new();
-        let (tx, rx) = chan.split();
+        let mut channel = OneShot::<u32>::new();
+        let (tx, rx) = channel.split();
         drop(tx);
         assert_eq!(rx.recv(), Err(RecvError));
     }
 
     #[test]
     fn receiver_dropped_before_send() {
-        let mut chan = OneShot::new();
-        let (tx, rx) = chan.split();
+        let mut channel = OneShot::new();
+        let (tx, rx) = channel.split();
         drop(rx);
         assert_eq!(tx.send(9u32), Err(9));
     }
 
     #[test]
     fn blocking_recv_waits_for_send() {
-        let mut chan = OneShot::<u32>::new();
-        let (tx, rx) = chan.split();
+        let mut channel = OneShot::<u32>::new();
+        let (tx, rx) = channel.split();
         std::thread::scope(|s| {
             let h = s.spawn(move || rx.recv());
             std::thread::sleep(Duration::from_millis(20));
@@ -273,8 +335,8 @@ mod tests {
             }
         }
         {
-            let mut chan = OneShot::new();
-            let (tx, rx) = chan.split();
+            let mut channel = OneShot::new();
+            let (tx, rx) = channel.split();
             assert!(tx.send(Guard(Arc::clone(&dropped))).is_ok());
             drop(rx);
         }
@@ -283,8 +345,8 @@ mod tests {
 
     #[tokio::test]
     async fn async_recv_waits_for_send() {
-        let mut chan = OneShot::<u32>::new();
-        let (tx, rx) = chan.split();
+        let mut channel = OneShot::<u32>::new();
+        let (tx, rx) = channel.split();
         let (got, ()) = tokio::join!(rx.recv_async(), async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             tx.send(55).unwrap();
@@ -294,12 +356,25 @@ mod tests {
 
     #[tokio::test]
     async fn async_recv_sender_dropped() {
-        let mut chan = OneShot::<u32>::new();
-        let (tx, rx) = chan.split();
+        let mut channel = OneShot::<u32>::new();
+        let (tx, rx) = channel.split();
         let (got, ()) = tokio::join!(rx.recv_async(), async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             drop(tx);
         });
         assert_eq!(got, Err(RecvError));
+    }
+
+    #[test]
+    fn arc_split_moves_owned_halves_across_threads() {
+        let channel = Arc::new(OneShot::<u32>::new());
+        let (tx, rx) = channel.arc_split();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            tx.send(42).unwrap();
+        });
+        let got = std::thread::spawn(move || rx.recv()).join().unwrap();
+        sender.join().unwrap();
+        assert_eq!(got, Ok(42));
     }
 }
