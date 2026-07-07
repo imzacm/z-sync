@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use tokio::sync::Semaphore as TkSemaphore;
-use z_sync::{Semaphore16 as ZSem16, Semaphore32 as ZSem32, Semaphore64 as ZSem64};
+use z_sync::{
+    Semaphore16 as ZSem16, Semaphore32 as ZSem32, Semaphore32Inline as ZSem32Inline,
+    Semaphore64 as ZSem64, Semaphore64Inline as ZSem64Inline,
+};
 
 const WORKERS: usize = 8;
 const OPS_PER_WORKER: usize = 1000;
@@ -133,6 +136,40 @@ fn bench_contended(c: &mut Criterion) {
     group.bench_function("z_sync::Semaphore64 (Async)", |b| {
         b.to_async(&rt).iter(|| async {
             let s = Arc::new(ZSem64::new(PERMITS));
+            let mut handles = Vec::with_capacity(WORKERS);
+            for _ in 0..WORKERS {
+                let s = Arc::clone(&s);
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..OPS_PER_WORKER {
+                        black_box(s.acquire_async().await);
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+    group.bench_function("z_sync::Semaphore32Inline (Async)", |b| {
+        b.to_async(&rt).iter(|| async {
+            let s = Arc::new(ZSem32Inline::new(PERMITS));
+            let mut handles = Vec::with_capacity(WORKERS);
+            for _ in 0..WORKERS {
+                let s = Arc::clone(&s);
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..OPS_PER_WORKER {
+                        black_box(s.acquire_async().await);
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+    group.bench_function("z_sync::Semaphore64Inline (Async)", |b| {
+        b.to_async(&rt).iter(|| async {
+            let s = Arc::new(ZSem64Inline::new(PERMITS));
             let mut handles = Vec::with_capacity(WORKERS);
             for _ in 0..WORKERS {
                 let s = Arc::clone(&s);

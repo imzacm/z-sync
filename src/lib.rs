@@ -26,7 +26,8 @@ pub use self::notify::{
 pub use self::observable_lock::ObservableLock;
 pub use self::park_strategy::ParkStrategy;
 pub use self::semaphore::{
-    Semaphore, Semaphore16, Semaphore32, Semaphore64, SemaphoreState, SemaphoreStateU16,
-    SemaphoreStateU32, SemaphoreStateU64,
+    Semaphore, Semaphore16, Semaphore16Boxed, Semaphore16Inline, Semaphore32, Semaphore32Boxed,
+    Semaphore32Inline, Semaphore64, Semaphore64Boxed, Semaphore64Inline, SemaphoreState,
+    SemaphoreStateU16, SemaphoreStateU32, SemaphoreStateU64,
 };
 pub use self::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
