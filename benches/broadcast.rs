@@ -78,8 +78,12 @@ fn bench_blocking_fanout(c: &mut Criterion) {
                                         sum += v;
                                         break;
                                     }
-                                    Err(z_sync::channels::broadcast::RecvError::Lagged(_)) => continue,
-                                    Err(z_sync::channels::broadcast::RecvError::Closed) => return sum,
+                                    Err(z_sync::channels::broadcast::RecvError::Lagged(_)) => {
+                                        continue;
+                                    }
+                                    Err(z_sync::channels::broadcast::RecvError::Closed) => {
+                                        return sum;
+                                    }
                                 }
                             }
                         }
