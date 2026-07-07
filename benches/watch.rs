@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use z_sync::watch::Watch;
+use z_sync::channels::watch::Watch;
 
 /// Round-trip: send a new value and observe the change from a receiver.
 fn bench_send_changed(c: &mut Criterion) {

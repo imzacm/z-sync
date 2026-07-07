@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use z_sync::oneshot::OneShot;
+use z_sync::channels::oneshot::OneShot;
 
 /// Round-trip: create a channel, send a value, receive it. Measures per-use overhead
 /// (construction + send + receive) on the resolved fast path.

@@ -6,16 +6,14 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-pub mod broadcast;
+pub mod channels;
 pub mod lock;
 pub mod notify;
 pub mod observable_lock;
-pub mod oneshot;
 pub mod park_strategy;
 pub mod semaphore;
 pub mod waker_queue;
 pub mod waker_storage;
-pub mod watch;
 
 pub use self::lock::{
     Lock, Lock16, Lock16Boxed, Lock16Inline, Lock32, Lock32Boxed, Lock32Inline, Lock64,

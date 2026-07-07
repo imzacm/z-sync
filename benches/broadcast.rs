@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use z_sync::broadcast::Broadcast;
+use z_sync::channels::broadcast::Broadcast;
 
 const MESSAGES: u64 = 100;
 const CAPACITY: usize = 256;
@@ -78,8 +78,8 @@ fn bench_blocking_fanout(c: &mut Criterion) {
                                         sum += v;
                                         break;
                                     }
-                                    Err(z_sync::broadcast::RecvError::Lagged(_)) => continue,
-                                    Err(z_sync::broadcast::RecvError::Closed) => return sum,
+                                    Err(z_sync::channels::broadcast::RecvError::Lagged(_)) => continue,
+                                    Err(z_sync::channels::broadcast::RecvError::Closed) => return sum,
                                 }
                             }
                         }
