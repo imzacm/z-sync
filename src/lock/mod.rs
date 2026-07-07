@@ -1,11 +1,10 @@
 mod state;
 
-use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::Ordering;
 use core::task::{Context, Poll, Waker};
 
 use num_traits::{ConstZero, NumCast};
@@ -14,12 +13,40 @@ pub use self::state::*;
 use crate::NotifyState;
 use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 use crate::waker_queue::{WakerQueueLock, WakerTicket};
+use crate::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
 
-pub type Lock16<T, P = DefaultParkStrategy> = Lock<T, LockStateU16, P>;
-pub type Lock32<T, P = DefaultParkStrategy> = Lock<T, LockStateU32, P>;
-pub type Lock64<T, P = DefaultParkStrategy> = Lock<T, LockStateU64, P>;
+// Async waker-storage variants. The bare `Lock{16,32,64}` names alias the default representation
+// (boxed: small struct, allocates lazily); the `Boxed`/`Inline` names select the representation
+// explicitly. Unlike `Notify`, inline is *not* recommended for contended locks — it regresses
+// contended async by putting both waker queues on the hot `state` cache line. See [`WakerStorage`].
 
-const ASYNC_CAPACITY: usize = 4;
+/// [`Lock16`] with boxed waker storage (the default): the lock stays small and allocates its two
+/// waker queues lazily (and never at all for blocking-only usage).
+pub type Lock16Boxed<T, P = DefaultParkStrategy> =
+    Lock<T, LockStateU16, P, BoxedWakers<ASYNC_CAPACITY>>;
+/// Boxed-waker variant of [`Lock32`]. See [`Lock16Boxed`].
+pub type Lock32Boxed<T, P = DefaultParkStrategy> =
+    Lock<T, LockStateU32, P, BoxedWakers<ASYNC_CAPACITY>>;
+/// Boxed-waker variant of [`Lock64`]. See [`Lock16Boxed`].
+pub type Lock64Boxed<T, P = DefaultParkStrategy> =
+    Lock<T, LockStateU64, P, BoxedWakers<ASYNC_CAPACITY>>;
+
+/// [`Lock16`] with inline waker storage: allocation-free on the async path (usable without a global
+/// allocator), at the cost of a much larger lock. Prefer the default boxed form under contention.
+pub type Lock16Inline<T, P = DefaultParkStrategy> =
+    Lock<T, LockStateU16, P, InlineWakers<ASYNC_CAPACITY>>;
+/// Inline-waker variant of [`Lock32`]. See [`Lock16Inline`].
+pub type Lock32Inline<T, P = DefaultParkStrategy> =
+    Lock<T, LockStateU32, P, InlineWakers<ASYNC_CAPACITY>>;
+/// Inline-waker variant of [`Lock64`]. See [`Lock16Inline`].
+pub type Lock64Inline<T, P = DefaultParkStrategy> =
+    Lock<T, LockStateU64, P, InlineWakers<ASYNC_CAPACITY>>;
+
+pub type Lock16<T, P = DefaultParkStrategy> = Lock16Boxed<T, P>;
+pub type Lock32<T, P = DefaultParkStrategy> = Lock32Boxed<T, P>;
+pub type Lock64<T, P = DefaultParkStrategy> = Lock64Boxed<T, P>;
+
+pub(crate) const ASYNC_CAPACITY: usize = 4;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const READ_SPIN_MAX: usize = 64;
@@ -39,8 +66,13 @@ const SPIN_CAP: usize = 16;
 const SPIN_YIELD_MAX: usize = 8;
 
 /// An efficient multi-purpose blocking and async lock supporting Mutex and RwLock style usage.
+///
+/// The `W` parameter selects how the async waker queues are stored — [`BoxedWakers`] (the default,
+/// keeping the lock small and allocating lazily) or [`InlineWakers`] (queues stored inline: larger
+/// lock, but allocation-free and indirection-free on the async path). It has no effect on the
+/// blocking path. See [`WakerStorage`] and the [`Lock16Inline`] aliases.
 #[derive(Debug)]
-pub struct Lock<T, S: LockState, P = DefaultParkStrategy> {
+pub struct Lock<T, S: LockState, P = DefaultParkStrategy, W = BoxedWakers<ASYNC_CAPACITY>> {
     _marker: core::marker::PhantomData<P>,
     /// Bit layout:
     /// - 0..16:   read async wakers count (u16)
@@ -51,37 +83,28 @@ pub struct Lock<T, S: LockState, P = DefaultParkStrategy> {
     /// - 48..64:  readers count (u16)
     state: S::Atomic,
     data: UnsafeCell<T>,
-    read_wakers: AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
-    write_wakers: AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
+    read_wakers: W,
+    write_wakers: W,
 }
 
-impl<T, S: LockState> Lock<T, S, DefaultParkStrategy> {
+impl<T, S: LockState, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, S, DefaultParkStrategy, W> {
     pub const fn new(data: T) -> Self {
         Self::with_park_strategy(data)
     }
 }
 
-impl<T, S: LockState, P> Default for Lock<T, S, P>
+impl<T, S: LockState, P, W> Default for Lock<T, S, P, W>
 where
     T: Default,
     P: ParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY>,
 {
     fn default() -> Self {
         Self::with_park_strategy(T::default())
     }
 }
 
-impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
-    pub const fn with_park_strategy(data: T) -> Self {
-        Self {
-            _marker: core::marker::PhantomData,
-            state: S::INITIAL_ATOMIC,
-            data: UnsafeCell::new(data),
-            read_wakers: AtomicPtr::new(core::ptr::null_mut()),
-            write_wakers: AtomicPtr::new(core::ptr::null_mut()),
-        }
-    }
-
+impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P, BoxedWakers<ASYNC_CAPACITY>> {
     #[inline(always)]
     pub fn into_observable<N: NotifyState>(self) -> crate::ObservableLock<T, S, N, P>
     where
@@ -89,47 +112,30 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
     {
         crate::ObservableLock::from_lock(self)
     }
+}
 
-    #[cold]
-    fn init_waker_queue(
-        ptr: &AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
-    ) -> &WakerQueueLock<ASYNC_CAPACITY> {
-        let queue = Box::into_raw(Box::new(WakerQueueLock::new()));
-        match ptr.compare_exchange(
-            core::ptr::null_mut(),
-            queue,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => unsafe { &*queue },
-            Err(existing) => {
-                unsafe { drop(Box::from_raw(queue)) };
-                unsafe { &*existing }
-            }
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, S, P, W> {
+    pub const fn with_park_strategy(data: T) -> Self {
+        Self {
+            _marker: core::marker::PhantomData,
+            state: S::INITIAL_ATOMIC,
+            data: UnsafeCell::new(data),
+            read_wakers: W::INIT,
+            write_wakers: W::INIT,
         }
     }
 
     #[inline(always)]
     fn get_read_wakers(&self) -> &WakerQueueLock<ASYNC_CAPACITY> {
-        let ptr = self.read_wakers.load(Ordering::Acquire);
-        if !ptr.is_null() {
-            unsafe { &*ptr }
-        } else {
-            Self::init_waker_queue(&self.read_wakers)
-        }
+        self.read_wakers.queue()
     }
 
     #[inline(always)]
     fn get_write_wakers(&self) -> &WakerQueueLock<ASYNC_CAPACITY> {
-        let ptr = self.write_wakers.load(Ordering::Acquire);
-        if !ptr.is_null() {
-            unsafe { &*ptr }
-        } else {
-            Self::init_waker_queue(&self.write_wakers)
-        }
+        self.write_wakers.queue()
     }
 
-    pub fn try_read(&self) -> Option<ReadGuard<'_, T, S, P>> {
+    pub fn try_read(&self) -> Option<ReadGuard<'_, T, S, P, W>> {
         // Fast test: Don't dirty the cache line if a writer is waiting/active.
         if cfg!(not(any(target_arch = "x86", target_arch = "x86_64")))
             && self.load_state(Ordering::Relaxed).has_any_write_state()
@@ -148,7 +154,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
         Some(guard)
     }
 
-    fn spin_try_read(&self) -> Option<ReadGuard<'_, T, S, P>> {
+    fn spin_try_read(&self) -> Option<ReadGuard<'_, T, S, P, W>> {
         let mut backoff = 1;
         for _ in 0..READ_SPIN_MAX {
             let state = self.load_state(Ordering::Relaxed);
@@ -181,7 +187,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
         None
     }
 
-    pub fn try_write(&self) -> Option<WriteGuard<'_, T, S, P>> {
+    pub fn try_write(&self) -> Option<WriteGuard<'_, T, S, P, W>> {
         let mut state = match S::atomic_compare_exchange_weak(
             &self.state,
             S::empty(),
@@ -213,7 +219,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
         }
     }
 
-    fn spin_try_write(&self) -> Option<WriteGuard<'_, T, S, P>> {
+    fn spin_try_write(&self) -> Option<WriteGuard<'_, T, S, P, W>> {
         let mut backoff = 1;
         for _ in 0..WRITE_SPIN_MAX {
             let state = self.load_state(Ordering::Relaxed);
@@ -248,7 +254,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
     }
 
     #[inline(always)]
-    pub fn read(&self) -> ReadGuard<'_, T, S, P> {
+    pub fn read(&self) -> ReadGuard<'_, T, S, P, W> {
         if let Some(guard) = self.try_read() {
             return guard;
         }
@@ -257,7 +263,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
 
     #[cold]
     #[inline(never)]
-    fn read_slow(&self) -> ReadGuard<'_, T, S, P> {
+    fn read_slow(&self) -> ReadGuard<'_, T, S, P, W> {
         if let Some(guard) = self.spin_try_read() {
             return guard;
         }
@@ -280,7 +286,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
     }
 
     #[inline(always)]
-    pub fn write(&self) -> WriteGuard<'_, T, S, P> {
+    pub fn write(&self) -> WriteGuard<'_, T, S, P, W> {
         if let Some(guard) = self.try_write() {
             return guard;
         }
@@ -289,7 +295,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
 
     #[cold]
     #[inline(never)]
-    fn write_slow(&self) -> WriteGuard<'_, T, S, P> {
+    fn write_slow(&self) -> WriteGuard<'_, T, S, P, W> {
         if let Some(guard) = self.spin_try_write() {
             return guard;
         }
@@ -310,12 +316,12 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
     }
 
     #[inline(always)]
-    pub fn read_async(&self) -> ReadFuture<'_, T, S, P> {
+    pub fn read_async(&self) -> ReadFuture<'_, T, S, P, W> {
         ReadFuture { lock: self, waker_node_ticket: None }
     }
 
     #[inline(always)]
-    pub fn write_async(&self) -> WriteFuture<'_, T, S, P> {
+    pub fn write_async(&self) -> WriteFuture<'_, T, S, P, W> {
         WriteFuture { lock: self, waker_node_ticket: None }
     }
 
@@ -412,7 +418,7 @@ impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P> {
     }
 }
 
-impl<T, S: LockState, P> Lock<T, S, P> {
+impl<T, S: LockState, P, W> Lock<T, S, P, W> {
     #[inline(always)]
     fn add_read_waker(&self, ordering: Ordering) -> S {
         S::atomic_add_read_waker(&self.state, ordering)
@@ -484,31 +490,25 @@ impl<T, S: LockState, P> Lock<T, S, P> {
     }
 }
 
-unsafe impl<T: Send, S: LockState> Send for Lock<T, S> {}
-unsafe impl<T: Send, S: LockState> Sync for Lock<T, S> {}
-
-impl<T, S: LockState, P> Drop for Lock<T, S, P> {
-    fn drop(&mut self) {
-        let read_wakers = self.read_wakers.load(Ordering::Relaxed);
-        if !read_wakers.is_null() {
-            unsafe { drop(Box::from_raw(read_wakers)) };
-        }
-
-        let write_wakers = self.write_wakers.load(Ordering::Relaxed);
-        if !write_wakers.is_null() {
-            unsafe { drop(Box::from_raw(write_wakers)) };
-        }
-    }
-}
+unsafe impl<T: Send, S: LockState, P, W> Send for Lock<T, S, P, W> {}
+unsafe impl<T: Send, S: LockState, P, W> Sync for Lock<T, S, P, W> {}
 
 #[derive(Debug)]
-pub struct ReadGuard<'a, T, S: LockState, P: ParkStrategy = DefaultParkStrategy> {
-    lock: &'a Lock<T, S, P>,
+pub struct ReadGuard<
+    'a,
+    T,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    lock: &'a Lock<T, S, P, W>,
 }
 
-impl<'a, T, S: LockState, P: ParkStrategy> ReadGuard<'a, T, S, P> {
+impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
+    ReadGuard<'a, T, S, P, W>
+{
     #[inline(always)]
-    pub fn map<U, F>(guard: ReadGuard<'a, T, S, P>, f: F) -> MappedReadGuard<'a, T, U, S, P>
+    pub fn map<U, F>(guard: ReadGuard<'a, T, S, P, W>, f: F) -> MappedReadGuard<'a, T, U, S, P, W>
     where
         F: FnOnce(&T) -> &U,
         U: ?Sized,
@@ -518,13 +518,17 @@ impl<'a, T, S: LockState, P: ParkStrategy> ReadGuard<'a, T, S, P> {
     }
 }
 
-impl<T, S: LockState, P: ParkStrategy> Drop for ReadGuard<'_, T, S, P> {
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for ReadGuard<'_, T, S, P, W>
+{
     fn drop(&mut self) {
         self.lock.common_dropped::<true>();
     }
 }
 
-impl<T, S: LockState, P: ParkStrategy> Deref for ReadGuard<'_, T, S, P> {
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Deref
+    for ReadGuard<'_, T, S, P, W>
+{
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -533,12 +537,21 @@ impl<T, S: LockState, P: ParkStrategy> Deref for ReadGuard<'_, T, S, P> {
 }
 
 #[derive(Debug)]
-pub struct MappedReadGuard<'a, T, U: ?Sized, S: LockState, P: ParkStrategy = DefaultParkStrategy> {
-    _guard: ReadGuard<'a, T, S, P>,
+pub struct MappedReadGuard<
+    'a,
+    T,
+    U: ?Sized,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    _guard: ReadGuard<'a, T, S, P, W>,
     value: &'a U,
 }
 
-impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy> Deref for MappedReadGuard<'a, T, U, S, P> {
+impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Deref
+    for MappedReadGuard<'a, T, U, S, P, W>
+{
     type Target = U;
 
     fn deref(&self) -> &U {
@@ -547,23 +560,35 @@ impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy> Deref for MappedReadGuard<
 }
 
 #[derive(Debug)]
-pub struct WriteGuard<'a, T, S: LockState, P: ParkStrategy = DefaultParkStrategy> {
-    lock: &'a Lock<T, S, P>,
+pub struct WriteGuard<
+    'a,
+    T,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    lock: &'a Lock<T, S, P, W>,
 }
 
-impl<'a, T, S: LockState, P: ParkStrategy> WriteGuard<'a, T, S, P> {
-    pub(crate) unsafe fn get_lock(guard: &Self) -> &'a Lock<T, S, P> {
+impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
+    WriteGuard<'a, T, S, P, W>
+{
+    pub(crate) unsafe fn get_lock(guard: &Self) -> &'a Lock<T, S, P, W> {
         guard.lock
     }
 }
 
-impl<T, S: LockState, P: ParkStrategy> Drop for WriteGuard<'_, T, S, P> {
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for WriteGuard<'_, T, S, P, W>
+{
     fn drop(&mut self) {
         self.lock.common_dropped::<false>();
     }
 }
 
-impl<T, S: LockState, P: ParkStrategy> Deref for WriteGuard<'_, T, S, P> {
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Deref
+    for WriteGuard<'_, T, S, P, W>
+{
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -571,20 +596,30 @@ impl<T, S: LockState, P: ParkStrategy> Deref for WriteGuard<'_, T, S, P> {
     }
 }
 
-impl<T, S: LockState, P: ParkStrategy> DerefMut for WriteGuard<'_, T, S, P> {
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> DerefMut
+    for WriteGuard<'_, T, S, P, W>
+{
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.lock.data.get() }
     }
 }
 
 #[derive(Debug)]
-pub struct ReadFuture<'a, T, S: LockState, P: ParkStrategy = DefaultParkStrategy> {
-    lock: &'a Lock<T, S, P>,
+pub struct ReadFuture<
+    'a,
+    T,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    lock: &'a Lock<T, S, P, W>,
     waker_node_ticket: Option<WakerTicket>,
 }
 
-impl<'a, T, S: LockState, P: ParkStrategy> Future for ReadFuture<'a, T, S, P> {
-    type Output = ReadGuard<'a, T, S, P>;
+impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Future
+    for ReadFuture<'a, T, S, P, W>
+{
+    type Output = ReadGuard<'a, T, S, P, W>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
@@ -631,7 +666,9 @@ impl<'a, T, S: LockState, P: ParkStrategy> Future for ReadFuture<'a, T, S, P> {
     }
 }
 
-impl<T, S: LockState, P: ParkStrategy> Drop for ReadFuture<'_, T, S, P> {
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for ReadFuture<'_, T, S, P, W>
+{
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
             && self.lock.get_read_wakers().lock().remove(ticket)
@@ -642,13 +679,21 @@ impl<T, S: LockState, P: ParkStrategy> Drop for ReadFuture<'_, T, S, P> {
 }
 
 #[derive(Debug)]
-pub struct WriteFuture<'a, T, S: LockState, P: ParkStrategy = DefaultParkStrategy> {
-    lock: &'a Lock<T, S, P>,
+pub struct WriteFuture<
+    'a,
+    T,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    lock: &'a Lock<T, S, P, W>,
     waker_node_ticket: Option<WakerTicket>,
 }
 
-impl<'a, T, S: LockState, P: ParkStrategy> Future for WriteFuture<'a, T, S, P> {
-    type Output = WriteGuard<'a, T, S, P>;
+impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Future
+    for WriteFuture<'a, T, S, P, W>
+{
+    type Output = WriteGuard<'a, T, S, P, W>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
@@ -704,7 +749,9 @@ impl<'a, T, S: LockState, P: ParkStrategy> Future for WriteFuture<'a, T, S, P> {
     }
 }
 
-impl<T, S: LockState, P: ParkStrategy> Drop for WriteFuture<'_, T, S, P> {
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for WriteFuture<'_, T, S, P, W>
+{
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
             && self.lock.get_write_wakers().lock().remove(ticket)

@@ -20,22 +20,35 @@ use crate::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
 
 pub(crate) const ASYNC_CAPACITY: usize = 2;
 
-pub type Notify16<P = DefaultParkStrategy> = Notify<NotifyStateU16, P>;
-pub type Notify32<P = DefaultParkStrategy> = Notify<NotifyStateU32, P>;
-pub type Notify64<P = DefaultParkStrategy> = Notify<NotifyStateU64, P>;
+// Async waker-storage variants. The bare `Notify{16,32,64}` names alias the default
+// representation (inline: allocation-free, larger struct); the `Inline`/`Boxed` names select the
+// representation explicitly. See [`WakerStorage`].
 
-/// Small (pointer-sized) variant of [`Notify16`] that allocates its waker queue lazily.
-///
-/// Prefer this when the notify is used only from blocking code, or when its size matters more than
-/// async wake latency. See [`WakerStorage`].
+/// [`Notify16`] with inline waker storage (the default): larger struct, but allocation-free and
+/// indirection-free on the async path.
+pub type Notify16Inline<P = DefaultParkStrategy> =
+    Notify<NotifyStateU16, P, InlineWakers<ASYNC_CAPACITY>>;
+/// Inline-waker variant of [`Notify32`]. See [`Notify16Inline`].
+pub type Notify32Inline<P = DefaultParkStrategy> =
+    Notify<NotifyStateU32, P, InlineWakers<ASYNC_CAPACITY>>;
+/// Inline-waker variant of [`Notify64`]. See [`Notify16Inline`].
+pub type Notify64Inline<P = DefaultParkStrategy> =
+    Notify<NotifyStateU64, P, InlineWakers<ASYNC_CAPACITY>>;
+
+/// [`Notify16`] with boxed waker storage: pointer-sized struct that allocates its waker queue
+/// lazily (and never at all for blocking-only usage).
 pub type Notify16Boxed<P = DefaultParkStrategy> =
     Notify<NotifyStateU16, P, BoxedWakers<ASYNC_CAPACITY>>;
-/// Small (pointer-sized) variant of [`Notify32`]. See [`Notify16Boxed`].
+/// Boxed-waker variant of [`Notify32`]. See [`Notify16Boxed`].
 pub type Notify32Boxed<P = DefaultParkStrategy> =
     Notify<NotifyStateU32, P, BoxedWakers<ASYNC_CAPACITY>>;
-/// Small (pointer-sized) variant of [`Notify64`]. See [`Notify16Boxed`].
+/// Boxed-waker variant of [`Notify64`]. See [`Notify16Boxed`].
 pub type Notify64Boxed<P = DefaultParkStrategy> =
     Notify<NotifyStateU64, P, BoxedWakers<ASYNC_CAPACITY>>;
+
+pub type Notify16<P = DefaultParkStrategy> = Notify16Inline<P>;
+pub type Notify32<P = DefaultParkStrategy> = Notify32Inline<P>;
+pub type Notify64<P = DefaultParkStrategy> = Notify64Inline<P>;
 
 pub type Notify16Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU16, P>;
 pub type Notify32Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU32, P>;
