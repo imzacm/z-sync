@@ -13,7 +13,7 @@ use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::Notify32;
+use crate::Notify32Boxed;
 
 const INCOMPLETE: u8 = 0;
 const RUNNING: u8 = 1;
@@ -27,7 +27,10 @@ const COMPLETE: u8 = 2;
 #[derive(Debug)]
 pub struct Once {
     state: AtomicU8,
-    notify: Notify32,
+    // Boxed waker storage keeps `Once` (and `OnceCell`) pointer-small and cheap to construct; the
+    // async wait path is rare, so lazily allocating its queue on first contention is the right
+    // trade-off here.
+    notify: Notify32Boxed,
 }
 
 impl Default for Once {
@@ -63,7 +66,7 @@ impl Drop for RunGuard<'_> {
 impl Once {
     /// Creates a new, incomplete `Once`.
     pub const fn new() -> Self {
-        Self { state: AtomicU8::new(INCOMPLETE), notify: Notify32::new() }
+        Self { state: AtomicU8::new(INCOMPLETE), notify: Notify32Boxed::new() }
     }
 
     /// Returns `true` once the initialiser has completed successfully.
@@ -420,7 +423,12 @@ impl<T, F> Lazy<T, F> {
 
 impl<T, F: FnOnce() -> T> Lazy<T, F> {
     /// Forces initialisation (if it has not happened yet) and returns the value.
+    #[inline]
     pub fn force(this: &Lazy<T, F>) -> &T {
+        // Fast path: once initialised, `deref` is just a load — skip constructing the init closure.
+        if let Some(value) = this.cell.get() {
+            return value;
+        }
         this.cell.get_or_init(|| {
             let f = unsafe { (*this.init.get()).take() }.expect("Lazy initialised more than once");
             f()
