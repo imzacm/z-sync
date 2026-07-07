@@ -3,10 +3,9 @@ mod rc_listener;
 mod select;
 mod state;
 
-use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::Ordering;
 use core::task::Waker;
 
 use num_traits::{ConstZero, NumCast};
@@ -17,12 +16,26 @@ pub use self::select::select_blocking;
 pub use self::state::*;
 use crate::park_strategy::{DefaultParkStrategy, FilterOp, ParkStrategy};
 use crate::waker_queue::WakerQueueLock;
+use crate::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
 
-const ASYNC_CAPACITY: usize = 2;
+pub(crate) const ASYNC_CAPACITY: usize = 2;
 
 pub type Notify16<P = DefaultParkStrategy> = Notify<NotifyStateU16, P>;
 pub type Notify32<P = DefaultParkStrategy> = Notify<NotifyStateU32, P>;
 pub type Notify64<P = DefaultParkStrategy> = Notify<NotifyStateU64, P>;
+
+/// Small (pointer-sized) variant of [`Notify16`] that allocates its waker queue lazily.
+///
+/// Prefer this when the notify is used only from blocking code, or when its size matters more than
+/// async wake latency. See [`WakerStorage`].
+pub type Notify16Boxed<P = DefaultParkStrategy> =
+    Notify<NotifyStateU16, P, BoxedWakers<ASYNC_CAPACITY>>;
+/// Small (pointer-sized) variant of [`Notify32`]. See [`Notify16Boxed`].
+pub type Notify32Boxed<P = DefaultParkStrategy> =
+    Notify<NotifyStateU32, P, BoxedWakers<ASYNC_CAPACITY>>;
+/// Small (pointer-sized) variant of [`Notify64`]. See [`Notify16Boxed`].
+pub type Notify64Boxed<P = DefaultParkStrategy> =
+    Notify<NotifyStateU64, P, BoxedWakers<ASYNC_CAPACITY>>;
 
 pub type Notify16Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU16, P>;
 pub type Notify32Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU32, P>;
@@ -37,65 +50,44 @@ pub type Notify64Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, Noti
 /// A [`NotifyListener`] captures the epoch at creation time; it only completes
 /// once the epoch has advanced past that snapshot, which means a notification
 /// was fired *after* the listener was registered.
+/// The `W` parameter selects how the async waker queue is stored — [`InlineWakers`] (the default,
+/// no allocation but a larger struct) or [`BoxedWakers`] (pointer-sized, allocates lazily). It has
+/// no effect on the blocking path. See [`WakerStorage`] and the [`Notify16Boxed`] aliases.
 #[derive(Debug)]
-pub struct Notify<S: NotifyState, P = DefaultParkStrategy> {
+pub struct Notify<S: NotifyState, P = DefaultParkStrategy, W = InlineWakers<ASYNC_CAPACITY>> {
     _marker: core::marker::PhantomData<P>,
     /// Bit layout:
     /// - 0..16: async wakers count (u16)
     /// - 16..32: parked threads count (u16)
     /// - 32..64: epoch (u32)
     state: S::Atomic,
-    async_wakers: AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
+    async_wakers: W,
 }
 
-impl<S: NotifyState, P: ParkStrategy> Default for Notify<S, P> {
+impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Default for Notify<S, P, W> {
     fn default() -> Self {
         Self::with_park_strategy()
     }
 }
 
-impl<S: NotifyState> Notify<S, DefaultParkStrategy> {
+impl<S: NotifyState, W: WakerStorage<ASYNC_CAPACITY>> Notify<S, DefaultParkStrategy, W> {
     pub const fn new() -> Self {
         Self::with_park_strategy()
     }
 }
 
-impl<S: NotifyState, P: ParkStrategy> Notify<S, P> {
+impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Notify<S, P, W> {
     pub const fn with_park_strategy() -> Self {
         Self {
             _marker: core::marker::PhantomData,
             state: S::INITIAL_ATOMIC,
-            async_wakers: AtomicPtr::new(core::ptr::null_mut()),
-        }
-    }
-
-    #[cold]
-    fn init_waker_queue(
-        ptr: &AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
-    ) -> &WakerQueueLock<ASYNC_CAPACITY> {
-        let queue = Box::into_raw(Box::new(WakerQueueLock::new()));
-        match ptr.compare_exchange(
-            core::ptr::null_mut(),
-            queue,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => unsafe { &*queue },
-            Err(existing) => {
-                unsafe { drop(Box::from_raw(queue)) };
-                unsafe { &*existing }
-            }
+            async_wakers: W::INIT,
         }
     }
 
     #[inline(always)]
     fn get_async_wakers(&self) -> &WakerQueueLock<ASYNC_CAPACITY> {
-        let ptr = self.async_wakers.load(Ordering::Acquire);
-        if !ptr.is_null() {
-            unsafe { &*ptr }
-        } else {
-            Self::init_waker_queue(&self.async_wakers)
-        }
+        self.async_wakers.queue()
     }
 
     #[inline(always)]
@@ -137,13 +129,13 @@ impl<S: NotifyState, P: ParkStrategy> Notify<S, P> {
     /// listener.wait();   // or  listener.await
     /// ```
     #[inline(always)]
-    pub fn listener(&self) -> NotifyListener<'_, S, P> {
+    pub fn listener(&self) -> NotifyListener<'_, S, P, W> {
         let epoch = self.load_state(Ordering::Acquire).epoch();
         NotifyListener::new(self, epoch)
     }
 
     #[inline(always)]
-    pub fn rc_listener(self: &Rc<Self>) -> NotifyRcListener<S, P> {
+    pub fn rc_listener(self: &Rc<Self>) -> NotifyRcListener<S, P, W> {
         let epoch = self.load_state(Ordering::Acquire).epoch();
         NotifyRcListener::new(Rc::clone(self), epoch)
     }
@@ -290,5 +282,31 @@ mod tests {
             size_of::<Notify32<crate::park_strategy::ParkingLot>>(),
             size_of::<Notify32<crate::park_strategy::Spin>>()
         );
+    }
+
+    #[test]
+    fn boxed_storage_is_pointer_sized_and_smaller_than_inline() {
+        // The boxed variant keeps the notify small (state word + one pointer); the inline default
+        // trades size for allocation-free async waking.
+        assert_eq!(size_of::<Notify32Boxed>(), size_of::<usize>() * 2);
+        assert!(size_of::<Notify32Boxed>() < size_of::<Notify32>());
+    }
+
+    #[tokio::test]
+    async fn boxed_storage_async_and_blocking_work() {
+        let notify = Arc::new(Notify32Boxed::new());
+
+        let listener = notify.listener();
+        let notify_clone = notify.clone();
+        tokio::spawn(async move {
+            notify_clone.notify(1);
+        });
+        listener.await;
+
+        notify.notify(1);
+        let listener = notify.listener();
+        assert!(!listener.is_notified());
+        notify.notify(1);
+        assert!(listener.is_notified());
     }
 }

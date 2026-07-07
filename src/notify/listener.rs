@@ -6,10 +6,11 @@ use num_traits::ConstOne;
 
 #[cfg(feature = "std")]
 pub use self::timeout::NotifyTimeoutListener;
-use super::{Notify, NotifyState};
+use super::{ASYNC_CAPACITY, Notify, NotifyState};
 use crate::NotifyStateU64;
 use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 use crate::waker_queue::WakerTicket;
+use crate::waker_storage::{InlineWakers, WakerStorage};
 
 /// A listener that was created from a [`Notify`].
 ///
@@ -19,25 +20,28 @@ pub struct NotifyListener<
     'a,
     S: NotifyState = NotifyStateU64,
     P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = InlineWakers<ASYNC_CAPACITY>,
 > {
-    notify: &'a Notify<S, P>,
+    notify: &'a Notify<S, P, W>,
     /// The epoch snapshot taken when this listener was created.
     epoch: S::Epoch,
     waker_node_ticket: Option<WakerTicket>,
 }
 
-impl<'a, S: NotifyState, P: ParkStrategy> NotifyListener<'a, S, P> {
-    pub(super) fn new(notify: &'a Notify<S, P>, epoch: S::Epoch) -> Self {
+impl<'a, S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
+    NotifyListener<'a, S, P, W>
+{
+    pub(super) fn new(notify: &'a Notify<S, P, W>, epoch: S::Epoch) -> Self {
         Self { notify, epoch, waker_node_ticket: None }
     }
 
     #[inline(always)]
-    pub fn notification(&self) -> &'a Notify<S, P> {
+    pub fn notification(&self) -> &'a Notify<S, P, W> {
         self.notify
     }
 
     #[inline(always)]
-    pub fn is_notification(&self, notify: &Notify<S, P>) -> bool {
+    pub fn is_notification(&self, notify: &Notify<S, P, W>) -> bool {
         core::ptr::eq(self.notify, notify)
     }
 
@@ -48,7 +52,7 @@ impl<'a, S: NotifyState, P: ParkStrategy> NotifyListener<'a, S, P> {
     }
 
     #[cfg(feature = "std")]
-    pub fn with_timeout(self, timeout: std::time::Duration) -> NotifyTimeoutListener<'a, S, P> {
+    pub fn with_timeout(self, timeout: std::time::Duration) -> NotifyTimeoutListener<'a, S, P, W> {
         NotifyTimeoutListener::new(self, timeout)
     }
 
@@ -80,7 +84,8 @@ impl<'a, S: NotifyState, P: ParkStrategy> NotifyListener<'a, S, P> {
     }
 }
 
-impl<'a, S: NotifyState, P: ParkStrategy> Future for NotifyListener<'a, S, P>
+impl<'a, S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Future
+    for NotifyListener<'a, S, P, W>
 where
     S::Epoch: Unpin,
 {
@@ -140,7 +145,9 @@ where
     }
 }
 
-impl<'a, S: NotifyState, P: ParkStrategy> Drop for NotifyListener<'a, S, P> {
+impl<'a, S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for NotifyListener<'a, S, P, W>
+{
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
             && self.notify.get_async_wakers().lock().remove(ticket)
@@ -157,23 +164,30 @@ mod timeout {
     use super::*;
 
     #[derive(Debug)]
-    pub struct NotifyTimeoutListener<'a, S: NotifyState, P: ParkStrategy = DefaultParkStrategy> {
-        listener: NotifyListener<'a, S, P>,
+    pub struct NotifyTimeoutListener<
+        'a,
+        S: NotifyState,
+        P: ParkStrategy = DefaultParkStrategy,
+        W: WakerStorage<ASYNC_CAPACITY> = InlineWakers<ASYNC_CAPACITY>,
+    > {
+        listener: NotifyListener<'a, S, P, W>,
         timeout: Duration,
     }
 
-    impl<'a, S: NotifyState, P: ParkStrategy> NotifyTimeoutListener<'a, S, P> {
-        pub(super) fn new(listener: NotifyListener<'a, S, P>, timeout: Duration) -> Self {
+    impl<'a, S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
+        NotifyTimeoutListener<'a, S, P, W>
+    {
+        pub(super) fn new(listener: NotifyListener<'a, S, P, W>, timeout: Duration) -> Self {
             Self { listener, timeout }
         }
 
         #[inline(always)]
-        pub fn notification(&self) -> &'a Notify<S, P> {
+        pub fn notification(&self) -> &'a Notify<S, P, W> {
             self.listener.notification()
         }
 
         #[inline(always)]
-        pub fn is_notification(&self, notify: &Notify<S, P>) -> bool {
+        pub fn is_notification(&self, notify: &Notify<S, P, W>) -> bool {
             self.listener.is_notification(notify)
         }
 
