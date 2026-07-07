@@ -15,11 +15,27 @@ harness = false
 name = "semaphore"
 harness = false
 
+[[bench]]
+name = "oneshot"
+harness = false
+
+[[bench]]
+name = "broadcast"
+harness = false
+
+[[bench]]
+name = "watch"
+harness = false
+
 [features]
 default = ["std", "thin-vec"]
 std = ["dep:parking_lot_core"]
 
 thin-vec = ["dep:thin-vec"]
+
+# Use `triomphe::Arc` (a leaner, weakless Arc) for the crate's owned handles instead of
+# `alloc::sync::Arc`.
+triomphe-arc = ["dep:triomphe"]
 
 [dependencies]
 pin-project-lite = "0.2"
@@ -28,9 +44,12 @@ parking_lot_core = { version = "0.9", optional = true }
 crossbeam-utils = { version = "0.8", default-features = false }
 
 thin-vec = { version = "0.2", optional = true }
+triomphe = { version = "0.1", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio = { version = "1", features = ["full"] }
 event-listener = "5.4"
 parking_lot = "0.12"
+futures = "0.3"
+async-broadcast = "0.7"

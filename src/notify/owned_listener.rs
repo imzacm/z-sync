@@ -1,4 +1,5 @@
-use alloc::rc::Rc;
+use alloc::sync::Arc;
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll};
@@ -8,39 +9,56 @@ use num_traits::ConstOne;
 #[cfg(feature = "std")]
 pub use self::timeout::NotifyTimeoutListener;
 use super::{ASYNC_CAPACITY, Notify, NotifyState};
-use crate::NotifyStateU64;
 use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 use crate::waker_queue::WakerTicket;
 use crate::waker_storage::{InlineWakers, WakerStorage};
+use crate::{Holder, NotifyStateU64};
 
-/// A listener that was created from a [`Notify`].
+/// An owned listener created from a shared [`Notify`].
 ///
-/// Supports both blocking (`.wait()`) and async (`.await`) usage.
+/// Unlike the borrowed [`NotifyListener`](super::NotifyListener), this holds the `Notify` through an
+/// owned holder `H` — a std [`Arc`](alloc::sync::Arc), a `triomphe::Arc`, or an
+/// [`Rc`](alloc::rc::Rc) — so it borrows nothing and can be moved into a spawned thread or task.
+/// Construct it by cloning your holder and passing it to [`new`](NotifyOwnedListener::new); the
+/// [`NotifyArcListener`](super::NotifyArcListener) / [`NotifyRcListener`](super::NotifyRcListener)
+/// aliases (and [`Notify::arc_listener`](Notify::arc_listener) /
+/// [`rc_listener`](Notify::rc_listener)) cover the common holders. Supports both blocking
+/// (`.wait()`) and async (`.await`) usage.
 #[derive(Debug)]
-pub struct NotifyRcListener<
+pub struct NotifyOwnedListener<
     S: NotifyState = NotifyStateU64,
     P: ParkStrategy = DefaultParkStrategy,
     W: WakerStorage<ASYNC_CAPACITY> = InlineWakers<ASYNC_CAPACITY>,
+    H: Holder<Notify<S, P, W>> = Arc<Notify<S, P, W>>,
 > {
-    notify: Rc<Notify<S, P, W>>,
+    notify: H,
     /// The epoch snapshot taken when this listener was created.
     epoch: S::Epoch,
     waker_node_ticket: Option<WakerTicket>,
+    /// `P` and `W` are only referenced through `H`'s target type; keep them without affecting the
+    /// listener's auto traits.
+    _marker: PhantomData<fn() -> (P, W)>,
 }
 
-impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> NotifyRcListener<S, P, W> {
-    pub(super) fn new(notify: Rc<Notify<S, P, W>>, epoch: S::Epoch) -> Self {
-        Self { notify, epoch, waker_node_ticket: None }
+impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Notify<S, P, W>>>
+    NotifyOwnedListener<S, P, W, H>
+{
+    /// Creates a listener from an owned holder, snapshotting the current epoch.
+    ///
+    /// Clone your holder and pass it by value: `NotifyOwnedListener::new(Arc::clone(&notify))`.
+    pub fn new(holder: H) -> Self {
+        let epoch = holder.load_state(Ordering::Acquire).epoch();
+        Self { notify: holder, epoch, waker_node_ticket: None, _marker: PhantomData }
     }
 
     #[inline(always)]
-    pub fn notification(&self) -> &Rc<Notify<S, P, W>> {
+    pub fn notification(&self) -> &H {
         &self.notify
     }
 
     #[inline(always)]
     pub fn is_notification(&self, notify: &Notify<S, P, W>) -> bool {
-        core::ptr::eq(self.notify.as_ref(), notify)
+        core::ptr::eq(&*self.notify, notify)
     }
 
     /// Returns `true` if a notification has occurred since this listener was created.
@@ -50,7 +68,7 @@ impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> NotifyRcL
     }
 
     #[cfg(feature = "std")]
-    pub fn with_timeout(self, timeout: std::time::Duration) -> NotifyTimeoutListener<S, P, W> {
+    pub fn with_timeout(self, timeout: std::time::Duration) -> NotifyTimeoutListener<S, P, W, H> {
         NotifyTimeoutListener::new(self, timeout)
     }
 
@@ -82,10 +100,11 @@ impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> NotifyRcL
     }
 }
 
-impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Future
-    for NotifyRcListener<S, P, W>
+impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Notify<S, P, W>>>
+    Future for NotifyOwnedListener<S, P, W, H>
 where
     S::Epoch: Unpin,
+    H: Unpin,
 {
     type Output = ();
 
@@ -143,8 +162,8 @@ where
     }
 }
 
-impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
-    for NotifyRcListener<S, P, W>
+impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Notify<S, P, W>>>
+    Drop for NotifyOwnedListener<S, P, W, H>
 {
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take()
@@ -166,20 +185,25 @@ mod timeout {
         S: NotifyState,
         P: ParkStrategy = DefaultParkStrategy,
         W: WakerStorage<ASYNC_CAPACITY> = InlineWakers<ASYNC_CAPACITY>,
+        H: Holder<Notify<S, P, W>> = Arc<Notify<S, P, W>>,
     > {
-        listener: NotifyRcListener<S, P, W>,
+        listener: NotifyOwnedListener<S, P, W, H>,
         timeout: Duration,
     }
 
-    impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
-        NotifyTimeoutListener<S, P, W>
+    impl<
+        S: NotifyState,
+        P: ParkStrategy,
+        W: WakerStorage<ASYNC_CAPACITY>,
+        H: Holder<Notify<S, P, W>>,
+    > NotifyTimeoutListener<S, P, W, H>
     {
-        pub(super) fn new(listener: NotifyRcListener<S, P, W>, timeout: Duration) -> Self {
+        pub(super) fn new(listener: NotifyOwnedListener<S, P, W, H>, timeout: Duration) -> Self {
             Self { listener, timeout }
         }
 
         #[inline(always)]
-        pub fn notification(&self) -> &Rc<Notify<S, P, W>> {
+        pub fn notification(&self) -> &H {
             self.listener.notification()
         }
 

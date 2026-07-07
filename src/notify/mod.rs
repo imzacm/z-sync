@@ -1,17 +1,20 @@
 mod listener;
-mod rc_listener;
+mod owned_listener;
 mod select;
 mod state;
 
 use alloc::rc::Rc;
+use alloc::sync::Arc;
 use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
 use core::task::Waker;
 
 use num_traits::{ConstZero, NumCast};
+#[cfg(feature = "triomphe-arc")]
+use triomphe::Arc as TriompheArc;
 
 pub use self::listener::NotifyListener;
-pub use self::rc_listener::NotifyRcListener;
+pub use self::owned_listener::NotifyOwnedListener;
 pub use self::select::select_blocking;
 pub use self::state::*;
 use crate::park_strategy::{DefaultParkStrategy, FilterOp, ParkStrategy};
@@ -53,6 +56,28 @@ pub type Notify64<P = DefaultParkStrategy> = Notify64Inline<P>;
 pub type Notify16Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU16, P>;
 pub type Notify32Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU32, P>;
 pub type Notify64Listener<'a, P = DefaultParkStrategy> = NotifyListener<'a, NotifyStateU64, P>;
+
+/// A [`NotifyOwnedListener`] holding the `Notify` through an [`Rc`](alloc::rc::Rc).
+pub type NotifyRcListener<
+    S = NotifyStateU64,
+    P = DefaultParkStrategy,
+    W = InlineWakers<ASYNC_CAPACITY>,
+> = NotifyOwnedListener<S, P, W, Rc<Notify<S, P, W>>>;
+
+/// A [`NotifyOwnedListener`] holding the `Notify` through a std [`Arc`](alloc::sync::Arc).
+pub type NotifyArcListener<
+    S = NotifyStateU64,
+    P = DefaultParkStrategy,
+    W = InlineWakers<ASYNC_CAPACITY>,
+> = NotifyOwnedListener<S, P, W, Arc<Notify<S, P, W>>>;
+
+/// A [`NotifyOwnedListener`] holding the `Notify` through a `triomphe::Arc`.
+#[cfg(feature = "triomphe-arc")]
+pub type NotifyTriompheArcListener<
+    S = NotifyStateU64,
+    P = DefaultParkStrategy,
+    W = InlineWakers<ASYNC_CAPACITY>,
+> = NotifyOwnedListener<S, P, W, TriompheArc<Notify<S, P, W>>>;
 
 /// A lightweight notification primitive supporting both blocking and async waiters.
 ///
@@ -147,10 +172,26 @@ impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Notify<S,
         NotifyListener::new(self, epoch)
     }
 
+    /// Creates an owned [`Rc`](alloc::rc::Rc)-backed listener.
     #[inline(always)]
     pub fn rc_listener(self: &Rc<Self>) -> NotifyRcListener<S, P, W> {
-        let epoch = self.load_state(Ordering::Acquire).epoch();
-        NotifyRcListener::new(Rc::clone(self), epoch)
+        NotifyOwnedListener::new(Rc::clone(self))
+    }
+
+    /// Creates an owned std [`Arc`](alloc::sync::Arc)-backed listener (movable across threads).
+    #[inline(always)]
+    pub fn arc_listener(self: &Arc<Self>) -> NotifyArcListener<S, P, W> {
+        NotifyOwnedListener::new(Arc::clone(self))
+    }
+
+    /// Creates an owned `triomphe::Arc`-backed listener.
+    ///
+    /// This is a free-standing associated function (call `Notify::triomphe_arc_listener(&arc)`)
+    /// rather than a method, because `triomphe::Arc` cannot be used as a `self` receiver on stable.
+    #[cfg(feature = "triomphe-arc")]
+    #[inline(always)]
+    pub fn triomphe_arc_listener(this: &TriompheArc<Self>) -> NotifyTriompheArcListener<S, P, W> {
+        NotifyOwnedListener::new(TriompheArc::clone(this))
     }
 
     /// Wake up to `n` waiting tasks/threads.
@@ -295,6 +336,43 @@ mod tests {
             size_of::<Notify32<crate::park_strategy::ParkingLot>>(),
             size_of::<Notify32<crate::park_strategy::Spin>>()
         );
+    }
+
+    #[test]
+    fn arc_listener_moves_across_threads_and_wakes() {
+        use std::time::Duration;
+
+        // The owned Arc listener borrows nothing, so it can be moved into a spawned thread.
+        let notify = Arc::new(Notify32::new());
+        let listener = notify.arc_listener();
+
+        let waiter = std::thread::spawn(move || listener.wait());
+        std::thread::sleep(Duration::from_millis(20));
+        notify.notify(1);
+        waiter.join().unwrap();
+    }
+
+    #[cfg(feature = "triomphe-arc")]
+    #[test]
+    fn triomphe_arc_listener_moves_across_threads_and_wakes() {
+        use std::time::Duration;
+
+        let notify = triomphe::Arc::new(Notify32::new());
+        let listener = Notify32::triomphe_arc_listener(&notify);
+
+        let waiter = std::thread::spawn(move || listener.wait());
+        std::thread::sleep(Duration::from_millis(20));
+        notify.notify(1);
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn rc_listener_still_works() {
+        let notify = Rc::new(Notify32::new());
+        let listener: NotifyRcListener<_> = notify.rc_listener();
+        assert!(!listener.is_notified());
+        notify.notify(1);
+        assert!(listener.is_notified());
     }
 
     #[test]

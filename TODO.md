@@ -13,16 +13,21 @@ crate offers a fast *both* in one place.
 
 ## Tier 1 — natural fits, high demand, reuse existing infra
 
-- [ ] **`Semaphore`** — counting semaphore with `acquire` / `try_acquire` / `acquire_async`, permits
+- [x] **`Semaphore`** — counting semaphore with `acquire` / `try_acquire` / `acquire_async`, permits
   released on guard drop. Highest-value lever: substrate for connection pools, rate limiters, and
-  bounded concurrency. Maps onto packed state (permit count) + `Notify`-style waiter wakeup. A `Mutex`
-  can become a trivial `Semaphore<1>` special case if we want to unify.
-- [ ] **Channels** — the `Notify` epoch + `WakerQueueLock` is essentially the wakeup half already.
-  Suggested order:
-    - [ ] `oneshot` — simplest, huge demand (task result / cancellation). Pairs with the drop-cleanup story.
-    - [ ] `mpsc` (bounded + unbounded) — bounded reuses `Semaphore` for backpressure.
-    - [ ] `broadcast` / `watch` — `watch` generalises `ObservableLock` (versioned value + multi-observer);
-      consider refactoring `ObservableLock` onto a shared `watch` core.
+  bounded concurrency. Maps onto packed state (permit count) + `Notify`-style waiter wakeup. Ships with
+  the `WakerStorage` (`Boxed`/`Inline`) convention.
+- **Channels** — the `Notify` epoch + `WakerQueueLock` is the wakeup half. Each is a standalone,
+  allocation-free core (no internal `Arc`); the caller owns it and `split`s borrowed sender/receiver
+  halves, so users choose how to share (stack + scoped threads, `static`, their own `Arc`).
+    - [x] `oneshot` — single value, one sender → one receiver, blocking + async, drop-close semantics.
+      Benched vs `tokio` and `futures`.
+    - [x] `watch` — latest value + version, one sender → many receivers (`borrow` / `changed`).
+      Supersedes the `ObservableLock` pattern. Benched vs `tokio`.
+    - [x] `broadcast` — bounded ring buffer, every receiver sees every message, `Lagged` detection,
+      per-slot `Lock` for concurrent reads. Benched vs `tokio` and `async-broadcast`.
+    - ~~`mpsc` (bounded + unbounded)~~ — **won't do here.** A separate library builds
+      `mpsc` / `mpmc` / `spsc` / `spmc` on top of these primitives.
 - [ ] **`Once` / `OnceCell` / `Lazy`** — one-time init with both `get_or_init` (blocking) and
   `get_or_init_async`. `const fn` constructors + `Notify` epoch make the "wait for the other initialiser"
   path cheap. Fills a `no_std` async gap `std::sync::OnceLock` can't cover.
