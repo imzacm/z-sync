@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use criterion::{Criterion, criterion_group, criterion_main};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::sync::{Mutex as TkMutex, RwLock as TkRwLock};
+use z_sync::lock::{Lock32Inline as ZLock32Inline, Lock64Inline as ZLock64Inline};
 use z_sync::{Lock16 as ZLock16, Lock32 as ZLock32, Lock64 as ZLock64};
 
 const WORKERS: usize = 8;
@@ -227,6 +228,20 @@ fn bench_write_only(c: &mut Criterion) {
         ZLock64::new(Payload(0)),
         |_i, m| black_box(m.write_async().await.0 += 1)
     );
+    bench_async!(
+        group,
+        "z_sync::Lock32Inline (Async)",
+        &rt,
+        ZLock32Inline::new(Payload(0)),
+        |_i, m| black_box(m.write_async().await.0 += 1)
+    );
+    bench_async!(
+        group,
+        "z_sync::Lock64Inline (Async)",
+        &rt,
+        ZLock64Inline::new(Payload(0)),
+        |_i, m| black_box(m.write_async().await.0 += 1)
+    );
 
     group.finish();
 }
@@ -391,6 +406,32 @@ fn bench_write_heavy(c: &mut Criterion) {
             black_box(m.read_async().await.0);
         }
     });
+    bench_async!(
+        group,
+        "z_sync::Lock32Inline (Async)",
+        &rt,
+        ZLock32Inline::new(Payload(0)),
+        |i, m| {
+            if i % 10 != 0 {
+                black_box(m.write_async().await.0 += 1);
+            } else {
+                black_box(m.read_async().await.0);
+            }
+        }
+    );
+    bench_async!(
+        group,
+        "z_sync::Lock64Inline (Async)",
+        &rt,
+        ZLock64Inline::new(Payload(0)),
+        |i, m| {
+            if i % 10 != 0 {
+                black_box(m.write_async().await.0 += 1);
+            } else {
+                black_box(m.read_async().await.0);
+            }
+        }
+    );
 
     group.finish();
 }
