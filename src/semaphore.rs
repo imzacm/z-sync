@@ -1,16 +1,16 @@
-use alloc::boxed::Box;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use num_traits::{ConstOne, ConstZero, NumCast, ToPrimitive};
 
 use crate::park_strategy::{DefaultParkStrategy, FilterOp, ParkStrategy};
 use crate::waker_queue::{WakerQueueLock, WakerTicket};
+use crate::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
 
-const ASYNC_CAPACITY: usize = 4;
+pub(crate) const ASYNC_CAPACITY: usize = 4;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const ACQUIRE_SPIN_MAX: usize = 64;
@@ -25,9 +25,35 @@ const SPIN_CAP: usize = 16;
 #[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
 const SPIN_YIELD_MAX: usize = 8;
 
-pub type Semaphore16<P = DefaultParkStrategy> = Semaphore<SemaphoreStateU16, P>;
-pub type Semaphore32<P = DefaultParkStrategy> = Semaphore<SemaphoreStateU32, P>;
-pub type Semaphore64<P = DefaultParkStrategy> = Semaphore<SemaphoreStateU64, P>;
+// Async waker-storage variants. The bare `Semaphore{16,32,64}` names alias the default
+// representation (boxed: small, allocates lazily); the `Boxed`/`Inline` names select the
+// representation explicitly. See [`WakerStorage`].
+
+/// [`Semaphore16`] with boxed waker storage (the default): small, allocates its waker queue lazily
+/// (and never at all for blocking-only usage).
+pub type Semaphore16Boxed<P = DefaultParkStrategy> =
+    Semaphore<SemaphoreStateU16, P, BoxedWakers<ASYNC_CAPACITY>>;
+/// Boxed-waker variant of [`Semaphore32`]. See [`Semaphore16Boxed`].
+pub type Semaphore32Boxed<P = DefaultParkStrategy> =
+    Semaphore<SemaphoreStateU32, P, BoxedWakers<ASYNC_CAPACITY>>;
+/// Boxed-waker variant of [`Semaphore64`]. See [`Semaphore16Boxed`].
+pub type Semaphore64Boxed<P = DefaultParkStrategy> =
+    Semaphore<SemaphoreStateU64, P, BoxedWakers<ASYNC_CAPACITY>>;
+
+/// [`Semaphore16`] with inline waker storage: allocation-free on the async path (usable without a
+/// global allocator), at the cost of a larger semaphore.
+pub type Semaphore16Inline<P = DefaultParkStrategy> =
+    Semaphore<SemaphoreStateU16, P, InlineWakers<ASYNC_CAPACITY>>;
+/// Inline-waker variant of [`Semaphore32`]. See [`Semaphore16Inline`].
+pub type Semaphore32Inline<P = DefaultParkStrategy> =
+    Semaphore<SemaphoreStateU32, P, InlineWakers<ASYNC_CAPACITY>>;
+/// Inline-waker variant of [`Semaphore64`]. See [`Semaphore16Inline`].
+pub type Semaphore64Inline<P = DefaultParkStrategy> =
+    Semaphore<SemaphoreStateU64, P, InlineWakers<ASYNC_CAPACITY>>;
+
+pub type Semaphore16<P = DefaultParkStrategy> = Semaphore16Boxed<P>;
+pub type Semaphore32<P = DefaultParkStrategy> = Semaphore32Boxed<P>;
+pub type Semaphore64<P = DefaultParkStrategy> = Semaphore64Boxed<P>;
 
 pub trait SemaphoreState: Sized + Copy + Clone + PartialEq + Eq {
     type Atomic: core::fmt::Debug;
@@ -172,61 +198,46 @@ atomic_semaphore_state!(pub struct SemaphoreStateU16(
 ///
 /// The `16`/`32`/`64` suffix selects the width of the packed atomic state word, which bounds the
 /// maximum permit count and the number of simultaneously parked/waking waiters.
+///
+/// The `W` parameter selects how the async waker queue is stored — [`BoxedWakers`] (the default,
+/// keeping the semaphore small and allocating lazily) or [`InlineWakers`] (queue stored inline:
+/// larger, but allocation-free on the async path). It has no effect on the blocking path. See
+/// [`WakerStorage`] and the [`Semaphore16Boxed`] / [`Semaphore16Inline`] aliases.
 #[derive(Debug)]
-pub struct Semaphore<S: SemaphoreState = SemaphoreStateU32, P = DefaultParkStrategy> {
+pub struct Semaphore<
+    S: SemaphoreState = SemaphoreStateU32,
+    P = DefaultParkStrategy,
+    W = BoxedWakers<ASYNC_CAPACITY>,
+> {
     _marker: PhantomData<P>,
     /// Bit layout (`SemaphoreStateU64`):
     /// - 0..16: async wakers count (u16)
     /// - 16..32: parked threads count (u16)
     /// - 32..64: available permits (u32)
     state: S::Atomic,
-    wakers: AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
+    async_wakers: W,
 }
 
-impl<S: SemaphoreState> Semaphore<S, DefaultParkStrategy> {
+impl<S: SemaphoreState, W: WakerStorage<ASYNC_CAPACITY>> Semaphore<S, DefaultParkStrategy, W> {
     pub fn new(permits: usize) -> Self {
         Self::with_park_strategy(permits)
     }
 }
 
-impl<S: SemaphoreState, P: ParkStrategy> Semaphore<S, P> {
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaphore<S, P, W> {
     pub fn with_park_strategy(permits: usize) -> Self {
         let permits: S::Permits =
             NumCast::from(permits).expect("permit count exceeds semaphore capacity");
         Self {
             _marker: PhantomData,
             state: S::atomic_with_permits(permits),
-            wakers: AtomicPtr::new(core::ptr::null_mut()),
-        }
-    }
-
-    #[cold]
-    fn init_waker_queue(
-        ptr: &AtomicPtr<WakerQueueLock<ASYNC_CAPACITY>>,
-    ) -> &WakerQueueLock<ASYNC_CAPACITY> {
-        let queue = Box::into_raw(Box::new(WakerQueueLock::new()));
-        match ptr.compare_exchange(
-            core::ptr::null_mut(),
-            queue,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => unsafe { &*queue },
-            Err(existing) => {
-                unsafe { drop(Box::from_raw(queue)) };
-                unsafe { &*existing }
-            }
+            async_wakers: W::INIT,
         }
     }
 
     #[inline(always)]
     fn get_wakers(&self) -> &WakerQueueLock<ASYNC_CAPACITY> {
-        let ptr = self.wakers.load(Ordering::Acquire);
-        if !ptr.is_null() {
-            unsafe { &*ptr }
-        } else {
-            Self::init_waker_queue(&self.wakers)
-        }
+        self.async_wakers.queue()
     }
 
     #[inline(always)]
@@ -242,7 +253,7 @@ impl<S: SemaphoreState, P: ParkStrategy> Semaphore<S, P> {
 
     /// Attempts to acquire a single permit without blocking.
     #[inline(always)]
-    pub fn try_acquire(&self) -> Option<SemaphorePermit<'_, S, P>> {
+    pub fn try_acquire(&self) -> Option<SemaphorePermit<'_, S, P, W>> {
         self.try_acquire_many(1)
     }
 
@@ -250,7 +261,7 @@ impl<S: SemaphoreState, P: ParkStrategy> Semaphore<S, P> {
     ///
     /// Returns `None` if fewer than `n` permits are available (or `n` exceeds this semaphore's
     /// capacity).
-    pub fn try_acquire_many(&self, n: usize) -> Option<SemaphorePermit<'_, S, P>> {
+    pub fn try_acquire_many(&self, n: usize) -> Option<SemaphorePermit<'_, S, P, W>> {
         let need: S::Permits = NumCast::from(n)?;
         if need == S::Permits::ZERO {
             return Some(SemaphorePermit { semaphore: self, permits: 0 });
@@ -276,7 +287,7 @@ impl<S: SemaphoreState, P: ParkStrategy> Semaphore<S, P> {
         }
     }
 
-    fn spin_try_acquire(&self, n: usize) -> Option<SemaphorePermit<'_, S, P>> {
+    fn spin_try_acquire(&self, n: usize) -> Option<SemaphorePermit<'_, S, P, W>> {
         let need: S::Permits = NumCast::from(n)?;
 
         let mut backoff = 1;
@@ -310,13 +321,13 @@ impl<S: SemaphoreState, P: ParkStrategy> Semaphore<S, P> {
 
     /// Acquires a single permit, blocking the current thread until one is available.
     #[inline(always)]
-    pub fn acquire(&self) -> SemaphorePermit<'_, S, P> {
+    pub fn acquire(&self) -> SemaphorePermit<'_, S, P, W> {
         self.acquire_many(1)
     }
 
     /// Acquires `n` permits, blocking the current thread until they are available.
     #[inline(always)]
-    pub fn acquire_many(&self, n: usize) -> SemaphorePermit<'_, S, P> {
+    pub fn acquire_many(&self, n: usize) -> SemaphorePermit<'_, S, P, W> {
         if let Some(guard) = self.try_acquire_many(n) {
             return guard;
         }
@@ -325,7 +336,7 @@ impl<S: SemaphoreState, P: ParkStrategy> Semaphore<S, P> {
 
     #[cold]
     #[inline(never)]
-    fn acquire_slow(&self, n: usize) -> SemaphorePermit<'_, S, P> {
+    fn acquire_slow(&self, n: usize) -> SemaphorePermit<'_, S, P, W> {
         if let Some(guard) = self.spin_try_acquire(n) {
             return guard;
         }
@@ -346,13 +357,13 @@ impl<S: SemaphoreState, P: ParkStrategy> Semaphore<S, P> {
 
     /// Acquires a single permit, resolving once one is available.
     #[inline(always)]
-    pub fn acquire_async(&self) -> AcquireFuture<'_, S, P> {
+    pub fn acquire_async(&self) -> AcquireFuture<'_, S, P, W> {
         self.acquire_many_async(1)
     }
 
     /// Acquires `n` permits, resolving once they are available.
     #[inline(always)]
-    pub fn acquire_many_async(&self, n: usize) -> AcquireFuture<'_, S, P> {
+    pub fn acquire_many_async(&self, n: usize) -> AcquireFuture<'_, S, P, W> {
         AcquireFuture { semaphore: self, n, waker_node_ticket: None }
     }
 
@@ -509,29 +520,27 @@ impl<S: SemaphoreState, P: ParkStrategy> Semaphore<S, P> {
     }
 }
 
-unsafe impl<S: SemaphoreState, P> Send for Semaphore<S, P> {}
-unsafe impl<S: SemaphoreState, P> Sync for Semaphore<S, P> {}
-
-impl<S: SemaphoreState, P> Drop for Semaphore<S, P> {
-    fn drop(&mut self) {
-        let wakers = self.wakers.load(Ordering::Relaxed);
-        if !wakers.is_null() {
-            unsafe { drop(Box::from_raw(wakers)) };
-        }
-    }
-}
+unsafe impl<S: SemaphoreState, P, W> Send for Semaphore<S, P, W> {}
+unsafe impl<S: SemaphoreState, P, W> Sync for Semaphore<S, P, W> {}
 
 /// A guard representing one or more acquired permits.
 ///
 /// The permits are returned to the semaphore when this guard is dropped, unless
 /// [`forget`](SemaphorePermit::forget) is called first.
 #[derive(Debug)]
-pub struct SemaphorePermit<'a, S: SemaphoreState, P: ParkStrategy = DefaultParkStrategy> {
-    semaphore: &'a Semaphore<S, P>,
+pub struct SemaphorePermit<
+    'a,
+    S: SemaphoreState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    semaphore: &'a Semaphore<S, P, W>,
     permits: usize,
 }
 
-impl<S: SemaphoreState, P: ParkStrategy> SemaphorePermit<'_, S, P> {
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
+    SemaphorePermit<'_, S, P, W>
+{
     /// The number of permits held by this guard.
     #[inline(always)]
     pub fn permits(&self) -> usize {
@@ -546,7 +555,9 @@ impl<S: SemaphoreState, P: ParkStrategy> SemaphorePermit<'_, S, P> {
     }
 }
 
-impl<S: SemaphoreState, P: ParkStrategy> Drop for SemaphorePermit<'_, S, P> {
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for SemaphorePermit<'_, S, P, W>
+{
     fn drop(&mut self) {
         if self.permits > 0 {
             self.semaphore.add_permits(self.permits);
@@ -555,14 +566,21 @@ impl<S: SemaphoreState, P: ParkStrategy> Drop for SemaphorePermit<'_, S, P> {
 }
 
 #[derive(Debug)]
-pub struct AcquireFuture<'a, S: SemaphoreState, P: ParkStrategy = DefaultParkStrategy> {
-    semaphore: &'a Semaphore<S, P>,
+pub struct AcquireFuture<
+    'a,
+    S: SemaphoreState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    semaphore: &'a Semaphore<S, P, W>,
     n: usize,
     waker_node_ticket: Option<WakerTicket>,
 }
 
-impl<'a, S: SemaphoreState, P: ParkStrategy> Future for AcquireFuture<'a, S, P> {
-    type Output = SemaphorePermit<'a, S, P>;
+impl<'a, S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Future
+    for AcquireFuture<'a, S, P, W>
+{
+    type Output = SemaphorePermit<'a, S, P, W>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
@@ -620,7 +638,9 @@ impl<'a, S: SemaphoreState, P: ParkStrategy> Future for AcquireFuture<'a, S, P> 
     }
 }
 
-impl<S: SemaphoreState, P: ParkStrategy> Drop for AcquireFuture<'_, S, P> {
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for AcquireFuture<'_, S, P, W>
+{
     fn drop(&mut self) {
         let Some(ticket) = self.waker_node_ticket.take() else { return };
 
@@ -862,5 +882,30 @@ mod tests {
         }
 
         assert_eq!(sem.available_permits(), PERMITS);
+    }
+
+    #[test]
+    fn boxed_storage_is_pointer_sized_and_smaller_than_inline() {
+        // The bare alias resolves to the boxed (default) representation; boxed keeps the semaphore
+        // small, inline trades size for allocation-free async.
+        assert_eq!(size_of::<Semaphore32>(), size_of::<Semaphore32Boxed>());
+        assert!(size_of::<Semaphore32Boxed>() < size_of::<Semaphore32Inline>());
+    }
+
+    #[tokio::test]
+    async fn inline_storage_async_and_blocking_work() {
+        let sem = Arc::new(Semaphore32Inline::new(1));
+
+        let held = sem.acquire();
+        let sem2 = Arc::clone(&sem);
+        let waiter = tokio::spawn(async move {
+            let _g = sem2.acquire_async().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        waiter.await.unwrap();
+        assert_eq!(sem.available_permits(), 1);
     }
 }
