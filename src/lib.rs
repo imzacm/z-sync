@@ -10,6 +10,7 @@ pub mod lock;
 pub mod notify;
 pub mod observable_lock;
 pub mod park_strategy;
+pub mod semaphore;
 pub mod waker_queue;
 
 pub use self::lock::{
@@ -21,3 +22,7 @@ pub use self::notify::{
 };
 pub use self::observable_lock::ObservableLock;
 pub use self::park_strategy::ParkStrategy;
+pub use self::semaphore::{
+    Semaphore, Semaphore16, Semaphore32, Semaphore64, SemaphoreState, SemaphoreStateU16,
+    SemaphoreStateU32, SemaphoreStateU64,
+};
