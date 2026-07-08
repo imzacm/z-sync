@@ -4,7 +4,7 @@ use std::sync::{Arc, Barrier as StdBarrier};
 use criterion::{Criterion, criterion_group, criterion_main};
 use tokio::sync::Barrier as TkBarrier;
 use z_sync::{
-    Barrier16 as ZBarrier16, Barrier32 as ZBarrier32, Barrier32Inline as ZBarrier32Inline,
+    Barrier16 as ZBarrier16, Barrier32 as ZBarrier32, Barrier32Boxed as ZBarrier32Boxed,
     Barrier64 as ZBarrier64, Barrier64Inline as ZBarrier64Inline,
 };
 
@@ -128,9 +128,9 @@ fn bench_contended(c: &mut Criterion) {
             }
         });
     });
-    group.bench_function("z_sync::Barrier32Inline (Async)", |b| {
+    group.bench_function("z_sync::Barrier32Boxed (Async)", |b| {
         b.to_async(&rt).iter(|| async {
-            let barrier = Arc::new(ZBarrier32Inline::new(WORKERS));
+            let barrier = Arc::new(ZBarrier32Boxed::new(WORKERS));
             let mut handles = Vec::with_capacity(WORKERS);
             for _ in 0..WORKERS {
                 let barrier = Arc::clone(&barrier);

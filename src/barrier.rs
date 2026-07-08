@@ -15,22 +15,13 @@ use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 use crate::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
 
 // Async waker-storage variants. The bare `Barrier{16,32,64}` names alias the default representation
-// (boxed: small, allocates its waker queue lazily); the `Boxed`/`Inline` names select the
-// representation explicitly. See [`WakerStorage`].
+// (inline: allocation-free, larger struct); the `Inline`/`Boxed` names select the representation
+// explicitly. Inline is the default because the barrier's wakeup path is `Notify`-backed (which
+// itself defaults to inline) and inline is never slower on the async rendezvous. See
+// [`WakerStorage`].
 
-/// [`Barrier16`] with boxed waker storage (the default): small, allocates its waker queue lazily
-/// (and never at all for blocking-only usage).
-pub type Barrier16Boxed<P = DefaultParkStrategy> =
-    Barrier<BarrierStateU16, P, BoxedWakers<ASYNC_CAPACITY>>;
-/// Boxed-waker variant of [`Barrier32`]. See [`Barrier16Boxed`].
-pub type Barrier32Boxed<P = DefaultParkStrategy> =
-    Barrier<BarrierStateU32, P, BoxedWakers<ASYNC_CAPACITY>>;
-/// Boxed-waker variant of [`Barrier64`]. See [`Barrier16Boxed`].
-pub type Barrier64Boxed<P = DefaultParkStrategy> =
-    Barrier<BarrierStateU64, P, BoxedWakers<ASYNC_CAPACITY>>;
-
-/// [`Barrier16`] with inline waker storage: allocation-free on the async path (usable without a
-/// global allocator), at the cost of a larger barrier.
+/// [`Barrier16`] with inline waker storage (the default): larger struct, but allocation-free and
+/// indirection-free on the async path.
 pub type Barrier16Inline<P = DefaultParkStrategy> =
     Barrier<BarrierStateU16, P, InlineWakers<ASYNC_CAPACITY>>;
 /// Inline-waker variant of [`Barrier32`]. See [`Barrier16Inline`].
@@ -40,9 +31,20 @@ pub type Barrier32Inline<P = DefaultParkStrategy> =
 pub type Barrier64Inline<P = DefaultParkStrategy> =
     Barrier<BarrierStateU64, P, InlineWakers<ASYNC_CAPACITY>>;
 
-pub type Barrier16<P = DefaultParkStrategy> = Barrier16Boxed<P>;
-pub type Barrier32<P = DefaultParkStrategy> = Barrier32Boxed<P>;
-pub type Barrier64<P = DefaultParkStrategy> = Barrier64Boxed<P>;
+/// [`Barrier16`] with boxed waker storage: pointer-sized struct that allocates its waker queue
+/// lazily (and never at all for blocking-only usage).
+pub type Barrier16Boxed<P = DefaultParkStrategy> =
+    Barrier<BarrierStateU16, P, BoxedWakers<ASYNC_CAPACITY>>;
+/// Boxed-waker variant of [`Barrier32`]. See [`Barrier16Boxed`].
+pub type Barrier32Boxed<P = DefaultParkStrategy> =
+    Barrier<BarrierStateU32, P, BoxedWakers<ASYNC_CAPACITY>>;
+/// Boxed-waker variant of [`Barrier64`]. See [`Barrier16Boxed`].
+pub type Barrier64Boxed<P = DefaultParkStrategy> =
+    Barrier<BarrierStateU64, P, BoxedWakers<ASYNC_CAPACITY>>;
+
+pub type Barrier16<P = DefaultParkStrategy> = Barrier16Inline<P>;
+pub type Barrier32<P = DefaultParkStrategy> = Barrier32Inline<P>;
+pub type Barrier64<P = DefaultParkStrategy> = Barrier64Inline<P>;
 
 /// The packed `(generation, count)` state of a [`Barrier`].
 ///
@@ -185,10 +187,10 @@ enum Arrival<G> {
 /// The `16`/`32`/`64` suffix selects the width of the packed atomic state word, bounding the party
 /// count and the number of rounds before the generation counter wraps (see [`BarrierState`]).
 ///
-/// The `W` parameter selects how the async waker queue is stored — [`BoxedWakers`] (the default,
-/// keeping the barrier small and allocating lazily) or [`InlineWakers`] (queue stored inline:
-/// larger, but allocation-free on the async path). It has no effect on the blocking path. See
-/// [`WakerStorage`] and the [`Barrier16Boxed`] / [`Barrier16Inline`] aliases.
+/// The `W` parameter selects how the async waker queue is stored — [`InlineWakers`] (the default,
+/// no allocation but a larger struct) or [`BoxedWakers`] (pointer-sized, allocates lazily). It has
+/// no effect on the blocking path. See [`WakerStorage`] and the [`Barrier16Inline`] /
+/// [`Barrier16Boxed`] aliases.
 ///
 /// Note: like `std::sync::Barrier`, a party is committed once it has arrived. Dropping a
 /// [`wait_async`](Barrier::wait_async) future after it has been polled (e.g. cancelling it) leaves
@@ -196,7 +198,7 @@ enum Arrival<G> {
 pub struct Barrier<
     S: BarrierState = BarrierStateU32,
     P = DefaultParkStrategy,
-    W = BoxedWakers<ASYNC_CAPACITY>,
+    W = InlineWakers<ASYNC_CAPACITY>,
 > {
     parties: usize,
     /// Bit layout (`BarrierStateU64`):
@@ -503,15 +505,16 @@ mod tests {
     }
 
     #[test]
-    fn boxed_storage_is_smaller_than_inline() {
-        // The bare alias resolves to the boxed (default) representation.
-        assert_eq!(size_of::<Barrier32>(), size_of::<Barrier32Boxed>());
+    fn inline_storage_is_default() {
+        // The bare alias resolves to the inline (default) representation; boxed is smaller but
+        // allocates its queue lazily.
+        assert_eq!(size_of::<Barrier32>(), size_of::<Barrier32Inline>());
         assert!(size_of::<Barrier32Boxed>() < size_of::<Barrier32Inline>());
     }
 
     #[tokio::test]
-    async fn inline_storage_works() {
-        let barrier = Arc::new(Barrier32Inline::new(2));
+    async fn boxed_storage_works() {
+        let barrier = Arc::new(Barrier32Boxed::new(2));
 
         let b2 = Arc::clone(&barrier);
         let waiter = tokio::spawn(async move { b2.wait_async().await });
