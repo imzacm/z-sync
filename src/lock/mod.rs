@@ -201,8 +201,8 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
         };
 
         loop {
-            // Instantly check if any readers or writers exist
-            if state.has_readers_or_writers() {
+            // Instantly check if any readers, writers, or an upgradable reader exist
+            if state.has_readers_or_writers() || state.has_upgradable() {
                 return None;
             }
 
@@ -226,6 +226,7 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
             let state = self.load_state(Ordering::Relaxed);
 
             if !state.has_readers_or_writers()
+                && !state.has_upgradable()
                 && let Some(guard) = self.try_write()
             {
                 return Some(guard);
@@ -244,6 +245,7 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
         for _ in 0..SPIN_YIELD_MAX {
             let state = self.load_state(Ordering::Relaxed);
             if !state.has_readers_or_writers()
+                && !state.has_upgradable()
                 && let Some(guard) = self.try_write()
             {
                 return Some(guard);
@@ -306,7 +308,9 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
         loop {
             P::park(self.writer_parking_key(), || {
                 let s = self.load_state(Ordering::Relaxed);
-                s.writers() > S::Writers::ZERO || s.readers() > S::Readers::ZERO
+                s.writers() > S::Writers::ZERO
+                    || s.readers() > S::Readers::ZERO
+                    || s.has_upgradable()
             });
 
             if let Some(guard) = self.try_write() {
@@ -345,7 +349,12 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
     #[inline(never)]
     fn common_dropped_slow(&self, state: S) {
         if state.has_write_waiters() {
-            if state.write_wakers() > S::WriteWakers::ZERO {
+            if state.has_upgradable() {
+                // A reader left while an upgrade is pending. The upgrading thread waits as a
+                // write-side waiter but may sit behind other write-waiters, so wake them all to
+                // guarantee it re-checks whether the readers have drained.
+                self.wake_all_write_waiters();
+            } else if state.write_wakers() > S::WriteWakers::ZERO {
                 self.wake_one_in_queue::<false>();
             } else if state.write_parked() > S::WriteParked::ZERO {
                 P::unpark_one(self.writer_parking_key());
@@ -418,6 +427,28 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
         S::atomic_fetch_sub_batch(&self.state, batch_sub, Ordering::Release);
     }
 
+    /// Wakes every parked/async reader (shared reads are now permitted).
+    fn wake_all_read_waiters(&self) {
+        let state = self.load_state(Ordering::Acquire);
+        if state.read_wakers() > S::ReadWakers::ZERO {
+            self.wake_all_in_queue::<true>();
+        }
+        if state.read_parked() > S::ReadParked::ZERO {
+            P::unpark_all(self.reader_parking_key());
+        }
+    }
+
+    /// Wakes every parked/async write-side waiter (blocked writers and upgraders).
+    fn wake_all_write_waiters(&self) {
+        let state = self.load_state(Ordering::Acquire);
+        if state.write_wakers() > S::WriteWakers::ZERO {
+            self.wake_all_in_queue::<false>();
+        }
+        if state.write_parked() > S::WriteParked::ZERO {
+            P::unpark_all(self.writer_parking_key());
+        }
+    }
+
     /// Atomically converts a held write lock into a read lock (`downgrade`). The caller must own
     /// the sole writer; on return a single reader is held. Parked/async readers are woken since
     /// shared reads are now permitted, while writers stay blocked (we still hold a read lock).
@@ -436,13 +467,229 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
                 Err(v) => state = v,
             }
         }
+        self.wake_all_read_waiters();
+    }
 
-        let state = self.load_state(Ordering::Acquire);
-        if state.read_wakers() > S::ReadWakers::ZERO {
-            self.wake_all_in_queue::<true>();
+    /// Atomically converts a held write lock into an upgradable read lock. Shared readers become
+    /// compatible again (woken), while writers and other upgraders stay excluded by the flag.
+    fn write_to_upgradable(&self) {
+        let mut state = self.load_state(Ordering::Relaxed);
+        loop {
+            let new = state.sub_writer_state().add_upgradable_state();
+            match S::atomic_compare_exchange_weak(
+                &self.state,
+                state,
+                new,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => state = v,
+            }
         }
-        if state.read_parked() > S::ReadParked::ZERO {
-            P::unpark_all(self.reader_parking_key());
+        self.wake_all_read_waiters();
+    }
+
+    /// Attempts to acquire an upgradable read lock without blocking: succeeds only when no writer,
+    /// write-waiter, or other upgrader is present (shared readers are fine). Yields to waiting
+    /// writers for fairness.
+    pub fn try_upgradable_read(&self) -> Option<UpgradableReadGuard<'_, T, S, P, W>> {
+        let mut state = self.load_state(Ordering::Relaxed);
+        loop {
+            if state.has_any_write_state() || state.has_upgradable() {
+                return None;
+            }
+            match S::atomic_compare_exchange_weak(
+                &self.state,
+                state,
+                state.add_upgradable_state(),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(UpgradableReadGuard { lock: self }),
+                Err(v) => state = v,
+            }
+        }
+    }
+
+    /// Post-park upgradable acquire: ignores write-waiters (which may include this thread) and only
+    /// yields to an actual writer or another live upgrader.
+    fn try_acquire_upgradable_ignoring_waiters(
+        &self,
+    ) -> Option<UpgradableReadGuard<'_, T, S, P, W>> {
+        let mut state = self.load_state(Ordering::Relaxed);
+        loop {
+            if state.writers() > S::Writers::ZERO || state.has_upgradable() {
+                return None;
+            }
+            match S::atomic_compare_exchange_weak(
+                &self.state,
+                state,
+                state.add_upgradable_state(),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(UpgradableReadGuard { lock: self }),
+                Err(v) => state = v,
+            }
+        }
+    }
+
+    fn spin_try_upgradable_read(&self) -> Option<UpgradableReadGuard<'_, T, S, P, W>> {
+        let mut backoff = 1;
+        for _ in 0..WRITE_SPIN_MAX {
+            let state = self.load_state(Ordering::Relaxed);
+            if !state.has_any_write_state()
+                && !state.has_upgradable()
+                && let Some(guard) = self.try_upgradable_read()
+            {
+                return Some(guard);
+            }
+            for _ in 0..backoff {
+                core::hint::spin_loop();
+            }
+            if backoff < SPIN_CAP {
+                backoff <<= 1;
+            }
+        }
+
+        #[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
+        for _ in 0..SPIN_YIELD_MAX {
+            let state = self.load_state(Ordering::Relaxed);
+            if !state.has_any_write_state()
+                && !state.has_upgradable()
+                && let Some(guard) = self.try_upgradable_read()
+            {
+                return Some(guard);
+            }
+            std::thread::yield_now();
+        }
+
+        None
+    }
+
+    /// Acquires an upgradable read lock, blocking until no writer or other upgrader holds it.
+    #[inline(always)]
+    pub fn upgradable_read(&self) -> UpgradableReadGuard<'_, T, S, P, W> {
+        if let Some(guard) = self.try_upgradable_read() {
+            return guard;
+        }
+        self.upgradable_read_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn upgradable_read_slow(&self) -> UpgradableReadGuard<'_, T, S, P, W> {
+        if let Some(guard) = self.spin_try_upgradable_read() {
+            return guard;
+        }
+
+        // Wait as a write-side waiter. This blocks new shared readers while we wait (they yield to
+        // us as they would to a pending writer) — the one behaviour that differs from parking_lot.
+        self.add_write_parker(Ordering::Relaxed);
+
+        loop {
+            P::park(self.writer_parking_key(), || {
+                let s = self.load_state(Ordering::Relaxed);
+                s.writers() > S::Writers::ZERO || s.has_upgradable()
+            });
+
+            if let Some(guard) = self.try_acquire_upgradable_ignoring_waiters() {
+                self.sub_write_parker(Ordering::Relaxed);
+                return guard;
+            }
+        }
+    }
+
+    /// Resolves to an upgradable read lock once no writer or other upgrader holds it.
+    #[inline(always)]
+    pub fn upgradable_read_async(&self) -> UpgradableReadFuture<'_, T, S, P, W> {
+        UpgradableReadFuture { lock: self, waker_node_ticket: None }
+    }
+
+    /// Attempts the upgradable → write transition: succeeds only if this upgrader is the sole
+    /// remaining reader (no shared readers) and no writer is present.
+    fn try_upgrade_inner(&self) -> bool {
+        let mut state = self.load_state(Ordering::Relaxed);
+        loop {
+            if state.readers() > S::Readers::ZERO || state.writers() > S::Writers::ZERO {
+                return false;
+            }
+            let new = state.sub_upgradable_state().add_writer_state();
+            match S::atomic_compare_exchange_weak(
+                &self.state,
+                state,
+                new,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(v) => state = v,
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn upgrade_slow(&self) -> WriteGuard<'_, T, S, P, W> {
+        // Register as a write-waiter first: this blocks *new* readers (via `has_any_write_state`)
+        // so that the existing readers can drain to zero.
+        self.add_write_parker(Ordering::Relaxed);
+
+        let mut backoff = 1;
+        for _ in 0..WRITE_SPIN_MAX {
+            if self.try_upgrade_inner() {
+                self.sub_write_parker(Ordering::Relaxed);
+                return WriteGuard { lock: self };
+            }
+            for _ in 0..backoff {
+                core::hint::spin_loop();
+            }
+            if backoff < SPIN_CAP {
+                backoff <<= 1;
+            }
+        }
+
+        loop {
+            P::park(self.writer_parking_key(), || {
+                self.load_state(Ordering::Relaxed).readers() > S::Readers::ZERO
+            });
+            if self.try_upgrade_inner() {
+                self.sub_write_parker(Ordering::Relaxed);
+                return WriteGuard { lock: self };
+            }
+        }
+    }
+
+    /// Converts a held upgradable read lock into a plain read lock (clears the flag, keeps a reader
+    /// slot). A parked upgrader — which can now proceed — is woken.
+    fn upgradable_to_read(&self) {
+        let mut state = self.load_state(Ordering::Relaxed);
+        loop {
+            let new = state.sub_upgradable_state().add_reader_state();
+            match S::atomic_compare_exchange_weak(
+                &self.state,
+                state,
+                new,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => state = v,
+            }
+        }
+        let state = self.load_state(Ordering::Acquire);
+        if state.has_write_waiters() {
+            self.wake_all_write_waiters();
+        }
+    }
+
+    /// Releases a held upgradable read lock (the flag), waking any write-side waiter it excluded.
+    fn upgrader_dropped(&self) {
+        let old = S::atomic_sub_upgrader(&self.state, Ordering::Release);
+        let state = old.sub_upgradable_state();
+        if state.has_write_waiters() {
+            self.wake_all_write_waiters();
         }
     }
 }
@@ -786,6 +1033,17 @@ impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
         lock.write_to_read();
         ReadGuard { lock }
     }
+
+    /// Atomically converts this write guard into an upgradable read guard without releasing the
+    /// lock in between. Shared readers are admitted again (and woken); the upgradable lock can
+    /// later be re-upgraded.
+    #[inline]
+    pub fn downgrade_to_upgradable(self) -> UpgradableReadGuard<'a, T, S, P, W> {
+        let lock = self.lock;
+        core::mem::forget(self);
+        lock.write_to_upgradable();
+        UpgradableReadGuard { lock }
+    }
 }
 
 impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
@@ -967,6 +1225,268 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
             && self.lock.get_write_wakers().lock().remove(ticket)
         {
             self.lock.sub_write_waker(Ordering::Relaxed);
+        }
+    }
+}
+
+/// A guard holding the lock in *upgradable read* mode: it grants shared read access (other readers
+/// may hold the lock concurrently) but excludes writers and other upgradable readers, so it can be
+/// atomically [`upgrade`](UpgradableReadGuard::upgrade)d to a write lock or
+/// [`downgrade`](UpgradableReadGuard::downgrade)d to a plain read lock.
+#[derive(Debug)]
+pub struct UpgradableReadGuard<
+    'a,
+    T,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    lock: &'a Lock<T, S, P, W>,
+}
+
+impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
+    UpgradableReadGuard<'a, T, S, P, W>
+{
+    /// Upgrades to a write lock, blocking until every shared reader has released. No other writer
+    /// or upgrader can interpose, since this guard already excludes them.
+    #[inline]
+    pub fn upgrade(self) -> WriteGuard<'a, T, S, P, W> {
+        let lock = self.lock;
+        // We drive the upgradable → write transition ourselves; skip the flag-releasing Drop.
+        core::mem::forget(self);
+        if lock.try_upgrade_inner() {
+            return WriteGuard { lock };
+        }
+        lock.upgrade_slow()
+    }
+
+    /// Attempts to upgrade without blocking: succeeds only if there are no other shared readers,
+    /// otherwise hands this guard back unchanged.
+    #[inline]
+    pub fn try_upgrade(self) -> Result<WriteGuard<'a, T, S, P, W>, Self> {
+        let lock = self.lock;
+        if lock.try_upgrade_inner() {
+            core::mem::forget(self);
+            Ok(WriteGuard { lock })
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Resolves to a write lock once every shared reader has released.
+    ///
+    /// Cancellation note: if the returned future is dropped before it resolves, the upgradable lock
+    /// it held is released (there is no guard to hand back from a dropped future).
+    #[inline]
+    pub fn upgrade_async(self) -> UpgradeFuture<'a, T, S, P, W> {
+        let lock = self.lock;
+        // Transfer the held upgradable flag into the future.
+        core::mem::forget(self);
+        UpgradeFuture { lock, waker_node_ticket: None, completed: false }
+    }
+
+    /// Downgrades to a plain read lock, keeping read access but releasing the upgrade privilege so
+    /// another upgrader or writer may proceed.
+    #[inline]
+    pub fn downgrade(self) -> ReadGuard<'a, T, S, P, W> {
+        let lock = self.lock;
+        core::mem::forget(self);
+        lock.upgradable_to_read();
+        ReadGuard { lock }
+    }
+}
+
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Deref
+    for UpgradableReadGuard<'_, T, S, P, W>
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for UpgradableReadGuard<'_, T, S, P, W>
+{
+    fn drop(&mut self) {
+        self.lock.upgrader_dropped();
+    }
+}
+
+/// The future returned by [`Lock::upgradable_read_async`].
+#[derive(Debug)]
+pub struct UpgradableReadFuture<
+    'a,
+    T,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    lock: &'a Lock<T, S, P, W>,
+    waker_node_ticket: Option<WakerTicket>,
+}
+
+impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Future
+    for UpgradableReadFuture<'a, T, S, P, W>
+{
+    type Output = UpgradableReadGuard<'a, T, S, P, W>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+
+        if let Some(guard) = this.lock.try_acquire_upgradable_ignoring_waiters() {
+            if let Some(ticket) = this.waker_node_ticket.take()
+                && this.lock.get_write_wakers().lock().remove(ticket)
+            {
+                this.lock.sub_write_waker(Ordering::Relaxed);
+            }
+            return Poll::Ready(guard);
+        }
+
+        {
+            let mut queue = this.lock.get_write_wakers().lock();
+
+            if let Some(guard) = this.lock.try_acquire_upgradable_ignoring_waiters() {
+                if let Some(ticket) = this.waker_node_ticket.take()
+                    && queue.remove(ticket)
+                {
+                    this.lock.sub_write_waker(Ordering::Relaxed);
+                }
+                return Poll::Ready(guard);
+            }
+
+            if let Some(ticket) = this.waker_node_ticket {
+                let node = queue.node_mut(ticket.index());
+
+                if node.generation() == ticket.generation() {
+                    if node.waker().is_none_or(|w| !w.will_wake(cx.waker())) {
+                        *node.waker_mut() = Some(cx.waker().clone());
+                    }
+                } else {
+                    this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
+                    this.lock.add_write_waker(Ordering::SeqCst);
+                }
+            } else {
+                this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
+                this.lock.add_write_waker(Ordering::SeqCst);
+            }
+        }
+
+        if let Some(guard) = this.lock.try_acquire_upgradable_ignoring_waiters() {
+            if let Some(ticket) = this.waker_node_ticket.take()
+                && this.lock.get_write_wakers().lock().remove(ticket)
+            {
+                this.lock.sub_write_waker(Ordering::Relaxed);
+            }
+            return Poll::Ready(guard);
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for UpgradableReadFuture<'_, T, S, P, W>
+{
+    fn drop(&mut self) {
+        if let Some(ticket) = self.waker_node_ticket.take()
+            && self.lock.get_write_wakers().lock().remove(ticket)
+        {
+            self.lock.sub_write_waker(Ordering::Relaxed);
+        }
+    }
+}
+
+/// The future returned by [`UpgradableReadGuard::upgrade_async`].
+#[derive(Debug)]
+pub struct UpgradeFuture<
+    'a,
+    T,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    lock: &'a Lock<T, S, P, W>,
+    waker_node_ticket: Option<WakerTicket>,
+    completed: bool,
+}
+
+impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Future
+    for UpgradeFuture<'a, T, S, P, W>
+{
+    type Output = WriteGuard<'a, T, S, P, W>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+
+        if this.lock.try_upgrade_inner() {
+            this.completed = true;
+            if let Some(ticket) = this.waker_node_ticket.take()
+                && this.lock.get_write_wakers().lock().remove(ticket)
+            {
+                this.lock.sub_write_waker(Ordering::Relaxed);
+            }
+            return Poll::Ready(WriteGuard { lock: this.lock });
+        }
+
+        {
+            let mut queue = this.lock.get_write_wakers().lock();
+
+            if this.lock.try_upgrade_inner() {
+                this.completed = true;
+                if let Some(ticket) = this.waker_node_ticket.take()
+                    && queue.remove(ticket)
+                {
+                    this.lock.sub_write_waker(Ordering::Relaxed);
+                }
+                return Poll::Ready(WriteGuard { lock: this.lock });
+            }
+
+            if let Some(ticket) = this.waker_node_ticket {
+                let node = queue.node_mut(ticket.index());
+
+                if node.generation() == ticket.generation() {
+                    if node.waker().is_none_or(|w| !w.will_wake(cx.waker())) {
+                        *node.waker_mut() = Some(cx.waker().clone());
+                    }
+                } else {
+                    this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
+                    this.lock.add_write_waker(Ordering::SeqCst);
+                }
+            } else {
+                this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
+                this.lock.add_write_waker(Ordering::SeqCst);
+            }
+        }
+
+        if this.lock.try_upgrade_inner() {
+            this.completed = true;
+            if let Some(ticket) = this.waker_node_ticket.take()
+                && this.lock.get_write_wakers().lock().remove(ticket)
+            {
+                this.lock.sub_write_waker(Ordering::Relaxed);
+            }
+            return Poll::Ready(WriteGuard { lock: this.lock });
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
+    for UpgradeFuture<'_, T, S, P, W>
+{
+    fn drop(&mut self) {
+        if let Some(ticket) = self.waker_node_ticket.take()
+            && self.lock.get_write_wakers().lock().remove(ticket)
+        {
+            self.lock.sub_write_waker(Ordering::Relaxed);
+        }
+        if !self.completed {
+            // The future was cancelled mid-upgrade while still holding the upgradable flag; release
+            // it so the lock does not stay stuck.
+            self.lock.upgrader_dropped();
         }
     }
 }
@@ -1251,6 +1771,155 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Upgradable read tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn upgradable_allows_shared_readers_excludes_writers_and_upgraders() {
+        let lock = Lock::new(1u32);
+        let up = lock.upgradable_read();
+        assert_eq!(*up, 1);
+        // Shared readers are compatible with an upgradable reader.
+        assert!(lock.try_read().is_some());
+        assert_eq!(*lock.read(), 1);
+        // Writers and other upgraders are excluded.
+        assert!(lock.try_write().is_none());
+        assert!(lock.try_upgradable_read().is_none());
+        drop(up);
+        // Fully released afterwards.
+        assert!(lock.try_write().is_some());
+        assert_eq!(lock.load_state(Ordering::Relaxed), crate::LockStateU64::empty());
+    }
+
+    #[test]
+    fn try_upgrade_alone_succeeds_with_readers_fails() {
+        let lock = Lock::new(10u32);
+
+        // No other readers: upgrade succeeds.
+        let up = lock.upgradable_read();
+        let mut w = up.try_upgrade().ok().expect("no readers, upgrade should succeed");
+        *w += 1;
+        drop(w);
+        assert_eq!(*lock.read(), 11);
+
+        // A concurrent shared reader blocks a non-blocking upgrade.
+        let up = lock.upgradable_read();
+        let r = lock.read();
+        let up = up.try_upgrade().err().expect("shared reader present, try_upgrade must fail");
+        drop(r);
+        // Once the reader is gone it can upgrade.
+        assert!(up.try_upgrade().is_ok());
+    }
+
+    #[test]
+    fn upgrade_waits_for_readers_then_is_exclusive() {
+        let lock = Arc::new(Lock::new(0u32));
+        let up = lock.upgradable_read();
+
+        // A shared reader holds the lock briefly.
+        let lock2 = Arc::clone(&lock);
+        let reader = std::thread::spawn(move || {
+            let r = lock2.read();
+            std::thread::sleep(Duration::from_millis(30));
+            *r
+        });
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Blocking upgrade waits for the reader to drain, then holds it exclusively.
+        let mut w = up.upgrade();
+        *w = 7;
+        assert!(lock.try_read().is_none(), "write lock must be exclusive after upgrade");
+        assert_eq!(reader.join().unwrap(), 0);
+        drop(w);
+        assert_eq!(*lock.read(), 7);
+    }
+
+    #[test]
+    fn upgradable_downgrade_to_read_and_write_downgrade_to_upgradable() {
+        let lock = Lock::new(3u32);
+
+        // upgradable -> read: releases the upgrade privilege, so a new upgrader can appear.
+        let up = lock.upgradable_read();
+        let r = up.downgrade();
+        assert_eq!(*r, 3);
+        assert!(lock.try_upgradable_read().is_some());
+        assert!(lock.try_write().is_none(), "still holding a read guard");
+        drop(r);
+
+        // write -> upgradable: keeps exclusion of writers, admits shared readers.
+        let mut w = lock.write();
+        *w = 9;
+        let up = w.downgrade_to_upgradable();
+        assert_eq!(*up, 9);
+        assert!(lock.try_read().is_some());
+        assert!(lock.try_write().is_none());
+        drop(up);
+        assert_eq!(lock.load_state(Ordering::Relaxed), crate::LockStateU64::empty());
+    }
+
+    #[test]
+    fn upgrade_never_observes_intervening_write_under_contention() {
+        // The core invariant: while a thread holds the upgradable lock, no writer can modify the
+        // data, so the value it reads as an upgrader is unchanged when it upgrades.
+        const UPGRADERS: usize = 4;
+        const WRITERS: usize = 4;
+        const READERS: usize = 4;
+        const ITERS: usize = 300;
+
+        let lock = Arc::new(Lock::new(0u64));
+
+        let upgraders: Vec<_> = (0..UPGRADERS)
+            .map(|_| {
+                let lock = Arc::clone(&lock);
+                std::thread::spawn(move || {
+                    for _ in 0..ITERS {
+                        let up = lock.upgradable_read();
+                        let seen = *up;
+                        let mut w = up.upgrade();
+                        assert_eq!(*w, seen, "a writer modified data while upgradable was held");
+                        *w += 1;
+                    }
+                })
+            })
+            .collect();
+
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let lock = Arc::clone(&lock);
+                std::thread::spawn(move || {
+                    for _ in 0..ITERS {
+                        *lock.write() += 1;
+                    }
+                })
+            })
+            .collect();
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let lock = Arc::clone(&lock);
+                std::thread::spawn(move || {
+                    for _ in 0..ITERS {
+                        std::hint::black_box(*lock.read());
+                    }
+                })
+            })
+            .collect();
+
+        for h in upgraders {
+            h.join().unwrap();
+        }
+        for h in writers {
+            h.join().unwrap();
+        }
+        for h in readers {
+            h.join().unwrap();
+        }
+
+        assert_eq!(*lock.read(), ((UPGRADERS + WRITERS) * ITERS) as u64);
+        assert_eq!(lock.load_state(Ordering::Relaxed), crate::LockStateU64::empty());
+    }
+
+    // -------------------------------------------------------------------------
     // Async tests
     // -------------------------------------------------------------------------
 
@@ -1458,6 +2127,78 @@ mod tests {
 
         let expected = (ASYNC_TASKS + BLOCKING_THREADS) * INCREMENTS;
         assert_eq!(*lock.read(), expected);
+    }
+
+    #[tokio::test]
+    async fn async_upgradable_read_and_upgrade() {
+        let lock = Arc::new(Lock::new(0u32));
+
+        let up = lock.upgradable_read_async().await;
+        assert_eq!(*up, 0);
+
+        // A shared reader briefly holds the lock; the async upgrade waits for it.
+        let lock2 = Arc::clone(&lock);
+        let reader = tokio::spawn(async move {
+            let r = lock2.read_async().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            *r
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let mut w = up.upgrade_async().await;
+        *w = 42;
+        assert_eq!(reader.await.unwrap(), 0);
+        drop(w);
+        assert_eq!(*lock.read(), 42);
+    }
+
+    #[tokio::test]
+    async fn async_upgraders_are_mutually_exclusive() {
+        let lock = Arc::new(Lock::new(0u64));
+        const TASKS: usize = 6;
+        const ITERS: usize = 100;
+
+        let handles: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let lock = Arc::clone(&lock);
+                tokio::spawn(async move {
+                    for _ in 0..ITERS {
+                        let up = lock.upgradable_read_async().await;
+                        let seen = *up;
+                        let mut w = up.upgrade_async().await;
+                        assert_eq!(*w, seen);
+                        *w += 1;
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(*lock.read(), (TASKS * ITERS) as u64);
+    }
+
+    #[tokio::test]
+    async fn cancelled_upgrade_future_releases_upgradable_lock() {
+        let lock = Arc::new(Lock::new(0u32));
+
+        // Hold a reader so the upgrade cannot complete, then drop the upgrade future.
+        let r = lock.read();
+        let up = lock.upgradable_read();
+        {
+            let fut = up.upgrade_async();
+            tokio::pin!(fut);
+            // Poll once so it registers as a waiter, then cancel by dropping.
+            tokio::select! {
+                _ = fut.as_mut() => panic!("should not complete while a reader is held"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+        drop(r);
+        // The upgradable lock was released on cancellation, so the lock is fully free.
+        assert!(lock.try_write().is_some());
+        assert_eq!(lock.load_state(Ordering::Relaxed), crate::LockStateU64::empty());
     }
 
     #[tokio::test]
