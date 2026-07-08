@@ -1,6 +1,7 @@
 use std::hint::black_box;
 use std::sync::{Arc, Barrier as StdBarrier};
 
+use async_std::sync::Barrier as AsBarrier;
 use criterion::{Criterion, criterion_group, criterion_main};
 use tokio::sync::Barrier as TkBarrier;
 use z_sync::{
@@ -48,6 +49,10 @@ fn bench_uncontended(c: &mut Criterion) {
     });
     group.bench_function("tokio::sync::Barrier", |b| {
         let barrier = TkBarrier::new(1);
+        b.to_async(&rt).iter(|| async { black_box(barrier.wait().await) });
+    });
+    group.bench_function("async-std::Barrier", |b| {
+        let barrier = AsBarrier::new(1);
         b.to_async(&rt).iter(|| async { black_box(barrier.wait().await) });
     });
 
@@ -165,6 +170,23 @@ fn bench_contended(c: &mut Criterion) {
     group.bench_function("tokio::sync::Barrier (Async)", |b| {
         b.to_async(&rt).iter(|| async {
             let barrier = Arc::new(TkBarrier::new(WORKERS));
+            let mut handles = Vec::with_capacity(WORKERS);
+            for _ in 0..WORKERS {
+                let barrier = Arc::clone(&barrier);
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..ROUNDS {
+                        black_box(barrier.wait().await);
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    });
+    group.bench_function("async-std::Barrier (Async)", |b| {
+        b.to_async(&rt).iter(|| async {
+            let barrier = Arc::new(AsBarrier::new(WORKERS));
             let mut handles = Vec::with_capacity(WORKERS);
             for _ in 0..WORKERS {
                 let barrier = Arc::clone(&barrier);
