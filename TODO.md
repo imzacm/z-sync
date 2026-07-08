@@ -33,8 +33,9 @@ crate offers a fast *both* in one place.
   primitive uninitialised on error so a later call retries (`std::sync::OnceLock` semantics, no poison).
   `const fn` constructors; built on `Once` (`Notify`-backed wait). Fills a `no_std` async gap
   `std::sync::OnceLock` can't cover.
-- [ ] **`Barrier`** — N-party rendezvous (`wait` / `wait_async`); a counter + `Notify` broadcast. One type
-  covering both `std::sync::Barrier` and `tokio::sync::Barrier`.
+- [x] **`Barrier`** — N-party rendezvous (`wait` / `wait_async`); a packed `(generation, count)` word +
+  `Notify` broadcast, reusable across rounds with a single leader per round. One type covering both
+  `std::sync::Barrier` and `tokio::sync::Barrier`. Blocking and async parties share a round.
 - [ ] **`WaitGroup` / `CountdownLatch`** — Go-style "wait until N units complete." Counter down to zero,
   then wake-all. Nearly free given `Notify`.
 
