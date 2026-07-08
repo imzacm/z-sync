@@ -133,6 +133,49 @@ impl<S: NotifyState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Notify<S,
         S::atomic_load(&self.state, ordering)
     }
 
+    /// Reads the epoch field. Exposed so primitives (e.g. [`Once`](crate::Once)) can repurpose the
+    /// epoch to hold their own state and drive it directly, instead of carrying a second atomic.
+    #[inline(always)]
+    pub(crate) fn epoch(&self, ordering: Ordering) -> S::Epoch {
+        self.load_state(ordering).epoch()
+    }
+
+    /// Compare-exchanges the epoch field, preserving the waker/parked counts. Returns
+    /// `Err(actual_epoch)` if the current epoch differs from `current`.
+    pub(crate) fn cas_epoch(
+        &self,
+        current: S::Epoch,
+        new: S::Epoch,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), S::Epoch> {
+        let mut state = self.load_state(Ordering::Relaxed);
+        loop {
+            if state.epoch() != current {
+                return Err(state.epoch());
+            }
+            match S::atomic_compare_exchange_weak(
+                &self.state,
+                state,
+                state.with_epoch(new),
+                success,
+                failure,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    /// Wakes all current waiters without advancing the epoch (the caller changed it via
+    /// [`cas_epoch`](Notify::cas_epoch)).
+    pub(crate) fn wake_waiters(&self) {
+        let state = self.load_state(Ordering::Acquire);
+        if state.has_listeners() {
+            self.notify_cold(usize::MAX, state);
+        }
+    }
+
     #[inline(always)]
     pub fn has_listeners(&self) -> bool {
         self.load_state(Ordering::Acquire).has_listeners()

@@ -54,9 +54,9 @@ fn bench_blocking(c: &mut Criterion) {
     group.finish();
 }
 
-/// Owned-handle scenario: spawn a worker task that produces the value, and await it on the receiver.
-/// This is the realistic one-shot pattern and needs owned (`Arc`-backed) handles, which every
-/// competitor also uses; z-sync builds them from `arc_split`.
+/// Owned-handle scenario: spawn a worker task that produces the value, and await it on the
+/// receiver. This is the realistic one-shot pattern and needs owned (`Arc`-backed) handles, which
+/// every competitor also uses; z-sync builds them from `arc_split`.
 fn bench_spawn(c: &mut Criterion) {
     let mut group = c.benchmark_group("oneshot_spawn_worker");
     let rt = tokio::runtime::Runtime::new().unwrap();

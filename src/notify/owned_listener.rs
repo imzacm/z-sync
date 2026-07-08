@@ -16,8 +16,8 @@ use crate::{Holder, NotifyStateU64};
 
 /// An owned listener created from a shared [`Notify`].
 ///
-/// Unlike the borrowed [`NotifyListener`](super::NotifyListener), this holds the `Notify` through an
-/// owned holder `H` — a std [`Arc`](alloc::sync::Arc), a `triomphe::Arc`, or an
+/// Unlike the borrowed [`NotifyListener`](super::NotifyListener), this holds the `Notify` through
+/// an owned holder `H` — a std [`Arc`](alloc::sync::Arc), a `triomphe::Arc`, or an
 /// [`Rc`](alloc::rc::Rc) — so it borrows nothing and can be moved into a spawned thread or task.
 /// Construct it by cloning your holder and passing it to [`new`](NotifyOwnedListener::new); the
 /// [`NotifyArcListener`](super::NotifyArcListener) / [`NotifyRcListener`](super::NotifyRcListener)

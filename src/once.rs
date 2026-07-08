@@ -11,13 +11,18 @@ use core::convert::Infallible;
 use core::future::Future;
 use core::mem::MaybeUninit;
 use core::ops::Deref;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::Notify32Boxed;
 
-const INCOMPLETE: u8 = 0;
-const RUNNING: u8 = 1;
-const COMPLETE: u8 = 2;
+// The three states are stored directly in the backing `Notify`'s epoch word (its `Epoch` type is
+// `u16`), so `Once` carries a single atomic rather than a separate state byte. Every transition
+// changes the epoch, which is exactly the signal `Notify`'s listeners wait on — so driving the
+// epoch and waking waiters is the whole state machine. `COMPLETE` is terminal in shared use (only
+// `&mut` access resets it), so the epoch never cycles back onto a value a live waiter snapshotted.
+const INCOMPLETE: u16 = 0;
+const RUNNING: u16 = 1;
+const COMPLETE: u16 = 2;
 
 /// A primitive that runs an initialiser exactly once.
 ///
@@ -26,10 +31,9 @@ const COMPLETE: u8 = 2;
 /// returns to the incomplete state so a later call can retry.
 #[derive(Debug)]
 pub struct Once {
-    state: AtomicU8,
-    // Boxed waker storage keeps `Once` (and `OnceCell`) pointer-small and cheap to construct; the
-    // async wait path is rare, so lazily allocating its queue on first contention is the right
-    // trade-off here.
+    // Holds both the state machine (in the epoch word) and the wait/wake path. Boxed waker storage
+    // keeps `Once` (and `OnceCell`) pointer-small and cheap to construct; the async wait path is
+    // rare, so lazily allocating its queue on first contention is the right trade-off here.
     notify: Notify32Boxed,
 }
 
@@ -48,8 +52,14 @@ struct RunGuard<'a> {
 
 impl RunGuard<'_> {
     fn complete(mut self) {
-        self.once.state.store(COMPLETE, Ordering::Release);
-        self.once.notify.notify(usize::MAX);
+        // We hold the RUNNING claim, so this CAS only contends with waiters registering/parking
+        // (the waker/parked counts), which `cas_epoch` preserves — the epoch transition
+        // itself never fails.
+        let _ = self
+            .once
+            .notify
+            .cas_epoch(RUNNING, COMPLETE, Ordering::Release, Ordering::Relaxed);
+        self.once.notify.wake_waiters();
         self.defused = true;
     }
 }
@@ -57,8 +67,13 @@ impl RunGuard<'_> {
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         if !self.defused {
-            self.once.state.store(INCOMPLETE, Ordering::Release);
-            self.once.notify.notify(usize::MAX);
+            let _ = self.once.notify.cas_epoch(
+                RUNNING,
+                INCOMPLETE,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+            self.once.notify.wake_waiters();
         }
     }
 }
@@ -66,13 +81,13 @@ impl Drop for RunGuard<'_> {
 impl Once {
     /// Creates a new, incomplete `Once`.
     pub const fn new() -> Self {
-        Self { state: AtomicU8::new(INCOMPLETE), notify: Notify32Boxed::new() }
+        Self { notify: Notify32Boxed::new() }
     }
 
     /// Returns `true` once the initialiser has completed successfully.
     #[inline]
     pub fn is_completed(&self) -> bool {
-        self.state.load(Ordering::Acquire) == COMPLETE
+        self.notify.epoch(Ordering::Acquire) == COMPLETE
     }
 
     /// Runs `f` exactly once, blocking until initialisation has completed (by this or another
@@ -98,15 +113,12 @@ impl Once {
         self.run_blocking(f)
     }
 
+    #[cold]
+    #[inline(never)]
     fn run_blocking<E, F: FnOnce() -> Result<(), E>>(&self, f: F) -> Result<(), E> {
         loop {
-            match self.state.compare_exchange(
-                INCOMPLETE,
-                RUNNING,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
+            match self.notify.cas_epoch(INCOMPLETE, RUNNING, Ordering::Acquire, Ordering::Acquire) {
+                Ok(()) => {
                     let guard = RunGuard { once: self, defused: false };
                     f()?;
                     guard.complete();
@@ -117,7 +129,7 @@ impl Once {
                     // RUNNING: wait for the runner. INCOMPLETE (a reset): loop and retry the CAS.
                     if state == RUNNING {
                         let listener = self.notify.listener();
-                        if self.state.load(Ordering::Acquire) == RUNNING {
+                        if self.notify.epoch(Ordering::Acquire) == RUNNING {
                             listener.wait();
                         }
                     }
@@ -158,6 +170,7 @@ impl Once {
         self.run_async(f).await
     }
 
+    #[cold]
     async fn run_async<E, Fut, F>(&self, f: F) -> Result<(), E>
     where
         F: FnOnce() -> Fut,
@@ -166,13 +179,8 @@ impl Once {
         // `f` is consumed by the single runner; hold it in an Option so the loop can move it out.
         let mut f = Some(f);
         loop {
-            match self.state.compare_exchange(
-                INCOMPLETE,
-                RUNNING,
-                Ordering::Acquire,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
+            match self.notify.cas_epoch(INCOMPLETE, RUNNING, Ordering::Acquire, Ordering::Acquire) {
+                Ok(()) => {
                     let guard = RunGuard { once: self, defused: false };
                     (f.take().expect("runner claimed the initialiser once"))().await?;
                     guard.complete();
@@ -182,7 +190,7 @@ impl Once {
                 Err(state) => {
                     if state == RUNNING {
                         let listener = self.notify.listener();
-                        if self.state.load(Ordering::Acquire) == RUNNING {
+                        if self.notify.epoch(Ordering::Acquire) == RUNNING {
                             listener.await;
                         }
                     }
@@ -255,8 +263,12 @@ impl<T> OnceCell<T> {
     /// Creates a cell already holding `value`.
     pub fn with_value(value: T) -> Self {
         let cell = Self::new();
-        cell.once.state.store(COMPLETE, Ordering::Release);
         unsafe { (*cell.value.get()).write(value) };
+        // Fresh cell, exclusively owned: the epoch is INCOMPLETE and this transition can't contend.
+        let _ =
+            cell.once
+                .notify
+                .cas_epoch(INCOMPLETE, COMPLETE, Ordering::Release, Ordering::Relaxed);
         cell
     }
 
@@ -279,7 +291,7 @@ impl<T> OnceCell<T> {
     /// Returns a mutable reference to the value if the cell has been initialised.
     #[inline]
     pub fn get_mut(&mut self) -> Option<&mut T> {
-        if *self.once.state.get_mut() == COMPLETE {
+        if self.once.notify.epoch(Ordering::Relaxed) == COMPLETE {
             Some(unsafe { (*self.value.get()).assume_init_mut() })
         } else {
             None
@@ -308,7 +320,11 @@ impl<T> OnceCell<T> {
     }
 
     /// Returns the value, initialising it with `f` (blocking) if the cell is empty.
+    #[inline]
     pub fn get_or_init<F: FnOnce() -> T>(&self, f: F) -> &T {
+        if let Some(value) = self.get() {
+            return value;
+        }
         let _ = self.once.call_once_try(|| {
             unsafe { (*self.value.get()).write(f()) };
             Ok::<(), Infallible>(())
@@ -318,7 +334,11 @@ impl<T> OnceCell<T> {
 
     /// Returns the value, initialising it with `f` (blocking) if the cell is empty. If `f` returns
     /// `Err`, the cell stays empty and the error is returned.
+    #[inline]
     pub fn get_or_try_init<E, F: FnOnce() -> Result<T, E>>(&self, f: F) -> Result<&T, E> {
+        if let Some(value) = self.get() {
+            return Ok(value);
+        }
         self.once.call_once_try(|| {
             unsafe { (*self.value.get()).write(f()?) };
             Ok(())
@@ -332,6 +352,9 @@ impl<T> OnceCell<T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
+        if let Some(value) = self.get() {
+            return value;
+        }
         self.once
             .call_once_async(|| async {
                 let value = f().await;
@@ -348,6 +371,9 @@ impl<T> OnceCell<T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
+        if let Some(value) = self.get() {
+            return Ok(value);
+        }
         self.once
             .call_once_try_async(|| async {
                 let value = f().await?;
@@ -372,8 +398,13 @@ impl<T> OnceCell<T> {
 
     /// Takes the value out of the cell, leaving it empty. Requires unique access.
     pub fn take(&mut self) -> Option<T> {
-        if *self.once.state.get_mut() == COMPLETE {
-            *self.once.state.get_mut() = INCOMPLETE;
+        if self.once.notify.epoch(Ordering::Relaxed) == COMPLETE {
+            let _ = self.once.notify.cas_epoch(
+                COMPLETE,
+                INCOMPLETE,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             Some(unsafe { (*self.value.get()).assume_init_read() })
         } else {
             None
@@ -388,7 +419,7 @@ impl<T> OnceCell<T> {
 
 impl<T> Drop for OnceCell<T> {
     fn drop(&mut self) {
-        if *self.once.state.get_mut() == COMPLETE {
+        if self.once.notify.epoch(Ordering::Relaxed) == COMPLETE {
             unsafe { (*self.value.get()).assume_init_drop() };
         }
     }

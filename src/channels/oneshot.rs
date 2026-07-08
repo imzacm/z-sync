@@ -1,8 +1,8 @@
 //! A one-shot channel: a single value sent from one [`Sender`] to one [`Receiver`].
 //!
-//! The channel state lives in a standalone [`OneShot`] that the caller owns. The `Sender`/`Receiver`
-//! halves are generic over the [`Holder`](crate::Holder) that keeps the channel alive:
-//! [`split`](OneShot::split) yields borrowed halves (`&OneShot`), while
+//! The channel state lives in a standalone [`OneShot`] that the caller owns. The
+//! `Sender`/`Receiver` halves are generic over the [`Holder`](crate::Holder) that keeps the channel
+//! alive: [`split`](OneShot::split) yields borrowed halves (`&OneShot`), while
 //! [`arc_split`](OneShot::arc_split) / [`rc_split`](OneShot::rc_split) /
 //! [`triomphe_arc_split`](OneShot::triomphe_arc_split) yield owned halves that can be moved into a
 //! spawned thread or task. Wakeups reuse [`Notify`](crate::Notify), so the receiver can wait from
@@ -195,7 +195,8 @@ impl<T, H: Holder<OneShot<T>>> Sender<T, H> {
 impl<T, H: Holder<OneShot<T>>> Drop for Sender<T, H> {
     fn drop(&mut self) {
         // If we never sent, transition EMPTY→TX_CLOSED and wake the receiver. If a value was sent
-        // (SENT) or the receiver already left (RX_CLOSED), the CAS fails and there is nothing to do.
+        // (SENT) or the receiver already left (RX_CLOSED), the CAS fails and there is nothing to
+        // do.
         if self
             .channel
             .state
@@ -261,8 +262,8 @@ impl<T, H: Holder<OneShot<T>>> Receiver<T, H> {
 
 impl<T, H: Holder<OneShot<T>>> Drop for Receiver<T, H> {
     fn drop(&mut self) {
-        // Signal the sender that we are gone (only meaningful while still EMPTY). A SENT-but-untaken
-        // value is left in place for `OneShot::drop` to clean up.
+        // Signal the sender that we are gone (only meaningful while still EMPTY). A
+        // SENT-but-untaken value is left in place for `OneShot::drop` to clean up.
         let _ = self.channel.state.compare_exchange(
             EMPTY,
             RX_CLOSED,
