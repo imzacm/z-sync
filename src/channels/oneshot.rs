@@ -5,20 +5,25 @@
 //! alive: [`split`](OneShot::split) yields borrowed halves (`&OneShot`), while
 //! [`arc_split`](OneShot::arc_split) / [`rc_split`](OneShot::rc_split) /
 //! [`triomphe_arc_split`](OneShot::triomphe_arc_split) yield owned halves that can be moved into a
-//! spawned thread or task. Wakeups reuse [`Notify`](crate::Notify), so the receiver can wait from
-//! blocking or async code.
+//! spawned thread or task. An async receiver waits on a single [`AtomicWaker`](crate::AtomicWaker)
+//! and a blocking receiver parks its thread, so the single consumer can wait from either world
+//! without carrying a full waker queue.
 
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
+use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
+use core::task::Poll;
 
 #[cfg(feature = "triomphe-arc")]
 use triomphe::Arc as TriompheArc;
 
-use crate::{Holder, Notify32};
+use crate::Holder;
+use crate::atomic_waker::AtomicWaker;
+use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 
 /// A borrowed [`Sender`] (`&OneShot`).
 pub type RefSender<'a, T> = Sender<T, &'a OneShot<T>>;
@@ -66,7 +71,9 @@ pub enum TryRecvError {
 pub struct OneShot<T> {
     state: AtomicU8,
     value: UnsafeCell<MaybeUninit<T>>,
-    notify: Notify32,
+    /// The async receiver's waker. Blocking receivers park on [`park_key`](OneShot::park_key)
+    /// instead; a single receiver only ever uses one of the two.
+    waker: AtomicWaker,
 }
 
 // SAFETY: access to `value` is gated by `state` transitions, so the value crosses the
@@ -86,8 +93,23 @@ impl<T> OneShot<T> {
         Self {
             state: AtomicU8::new(EMPTY),
             value: UnsafeCell::new(MaybeUninit::uninit()),
-            notify: Notify32::new(),
+            waker: AtomicWaker::new(),
         }
+    }
+
+    /// The parking-lot key a blocking receiver waits on.
+    #[inline]
+    fn park_key(&self) -> usize {
+        core::ptr::from_ref(self) as usize
+    }
+
+    /// Wakes the receiver regardless of how it is waiting: `wake` delivers to an async waker if one
+    /// is registered, and `unpark_all` releases a parked blocking thread. A given receiver only
+    /// uses one of the two, so the other call is a cheap no-op.
+    #[inline]
+    fn wake_receiver(&self) {
+        self.waker.wake();
+        DefaultParkStrategy::unpark_all(self.park_key());
     }
 
     /// Splits into borrowed sender/receiver halves.
@@ -174,7 +196,7 @@ impl<T, H: Holder<OneShot<T>>> Sender<T, H> {
             .compare_exchange(EMPTY, SENT, Ordering::Release, Ordering::Acquire)
         {
             Ok(_) => {
-                self.channel.notify.notify(1);
+                self.channel.wake_receiver();
                 Ok(())
             }
             Err(_) => {
@@ -203,7 +225,7 @@ impl<T, H: Holder<OneShot<T>>> Drop for Sender<T, H> {
             .compare_exchange(EMPTY, TX_CLOSED, Ordering::Release, Ordering::Relaxed)
             .is_ok()
         {
-            self.channel.notify.notify(1);
+            self.channel.wake_receiver();
         }
     }
 }
@@ -237,26 +259,29 @@ impl<T, H: Holder<OneShot<T>>> Receiver<T, H> {
             if let Some(result) = self.poll_value() {
                 return result;
             }
-            let listener = self.channel.notify.listener();
-            if let Some(result) = self.poll_value() {
-                return result;
-            }
-            listener.wait();
+            // Park until the state leaves EMPTY. `park` re-checks the predicate under the parking
+            // lock, so a send racing this call is not missed.
+            DefaultParkStrategy::park(self.channel.park_key(), || {
+                self.channel.state.load(Ordering::Acquire) == EMPTY
+            });
         }
     }
 
     /// Resolves once the value is received or the sender is dropped.
     pub async fn recv_async(self) -> Result<T, RecvError> {
-        loop {
+        poll_fn(|cx| {
             if let Some(result) = self.poll_value() {
-                return result;
+                return Poll::Ready(result);
             }
-            let listener = self.channel.notify.listener();
-            if let Some(result) = self.poll_value() {
-                return result;
+            // Register, then re-check: a send between the first check and the registration is
+            // caught here, and one after it wakes our registered waker.
+            self.channel.waker.register(cx.waker());
+            match self.poll_value() {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
             }
-            listener.await;
-        }
+        })
+        .await
     }
 }
 

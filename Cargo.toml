@@ -47,6 +47,10 @@ harness = false
 name = "seqlock"
 harness = false
 
+[[bench]]
+name = "atomic_waker"
+harness = false
+
 [features]
 default = ["std", "thin-vec"]
 std = ["dep:parking_lot_core"]
