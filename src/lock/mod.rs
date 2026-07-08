@@ -56,15 +56,15 @@ const WRITE_SPIN_MAX: usize = 64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const SPIN_CAP: usize = 32;
 
+// Non-x86 spin tuning, aligned with the x86 values (more spinning, and no post-spin `yield_now`) on
+// the hypothesis that high-performance Arm cores behave more like x86 here than like weak/in-order
+// cores. Sweep individually if results are mixed.
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const READ_SPIN_MAX: usize = 16;
+const READ_SPIN_MAX: usize = 64;
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const WRITE_SPIN_MAX: usize = 32;
+const WRITE_SPIN_MAX: usize = 64;
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const SPIN_CAP: usize = 16;
-
-#[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
-const SPIN_YIELD_MAX: usize = 8;
+const SPIN_CAP: usize = 32;
 
 /// An efficient multi-purpose blocking and async lock supporting Mutex and RwLock style usage.
 ///
@@ -173,18 +173,6 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
             }
         }
 
-        // x86 seems to perform better without yielding.
-        #[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
-        for _ in 0..SPIN_YIELD_MAX {
-            let state = self.load_state(Ordering::Relaxed);
-            if !state.has_any_write_state()
-                && let Some(guard) = self.try_read()
-            {
-                return Some(guard);
-            }
-            std::thread::yield_now();
-        }
-
         None
     }
 
@@ -238,19 +226,6 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
             if backoff < SPIN_CAP {
                 backoff <<= 1;
             }
-        }
-
-        // x86 seems to perform better without yielding.
-        #[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
-        for _ in 0..SPIN_YIELD_MAX {
-            let state = self.load_state(Ordering::Relaxed);
-            if !state.has_readers_or_writers()
-                && !state.has_upgradable()
-                && let Some(guard) = self.try_write()
-            {
-                return Some(guard);
-            }
-            std::thread::yield_now();
         }
 
         None
@@ -551,18 +526,6 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
             if backoff < SPIN_CAP {
                 backoff <<= 1;
             }
-        }
-
-        #[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
-        for _ in 0..SPIN_YIELD_MAX {
-            let state = self.load_state(Ordering::Relaxed);
-            if !state.has_any_write_state()
-                && !state.has_upgradable()
-                && let Some(guard) = self.try_upgradable_read()
-            {
-                return Some(guard);
-            }
-            std::thread::yield_now();
         }
 
         None
@@ -1365,11 +1328,11 @@ impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Futu
                     }
                 } else {
                     this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                    this.lock.add_write_waker(Ordering::SeqCst);
+                    this.lock.add_write_waker(Ordering::Release);
                 }
             } else {
                 this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                this.lock.add_write_waker(Ordering::SeqCst);
+                this.lock.add_write_waker(Ordering::Release);
             }
         }
 
@@ -1452,11 +1415,11 @@ impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Futu
                     }
                 } else {
                     this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                    this.lock.add_write_waker(Ordering::SeqCst);
+                    this.lock.add_write_waker(Ordering::Release);
                 }
             } else {
                 this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                this.lock.add_write_waker(Ordering::SeqCst);
+                this.lock.add_write_waker(Ordering::Release);
             }
         }
 

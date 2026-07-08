@@ -313,10 +313,10 @@ impl<const CAP: usize> WakerQueueLock<CAP> {
                 }
                 if backoff < 64 {
                     backoff <<= 1; // Bitwise shift is microscopically faster than *= 2
-                } else if cfg!(not(any(target_arch = "x86", target_arch = "x86_64"))) {
-                    #[cfg(feature = "std")]
-                    std::thread::yield_now();
                 }
+                // Once the backoff caps, keep spinning on both x86 and Arm rather than yielding —
+                // the waker-queue lock is held only briefly, and `sched_yield`
+                // tends to hurt here.
             }
 
             // 3. The lock appears free, attempt to grab it
