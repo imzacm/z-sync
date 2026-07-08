@@ -52,8 +52,11 @@ crate offers a fast *both* in one place.
   (`ReadGuard`/`WriteGuard` `map`/`try_map` + `MappedReadGuard`/`MappedWriteGuard`). Implemented with
   a packed 1-bit upgradable flag (one reader bit) — benchmarked to add 0% to the read/write hot
   paths. Benched vs `parking_lot` (blocking) and `async-std`/`async_lock` (async).
-- [ ] **`SeqLock`** — lock-free reads for small `Copy`, read-mostly data (config snapshots, counters).
-  Complements `Lock` where readers must never block writers.
+- [x] **`SeqLock`** — lock-free reads for small `Copy`, read-mostly data (config snapshots, counters).
+  Sequence-counter design: readers optimistically copy then re-check the count, never taking a lock
+  or blocking writers; writers self-serialise on the odd bit. `read` / `try_read` / `write` /
+  `try_write` / `set` / `get_mut` / `into_inner`. `Lock` also gained `read_copy` / `try_read_copy` /
+  `read_copy_async` convenience methods (which still take the read lock — not lock-free).
 - [ ] **`AtomicWaker`** — single-waiter waker cell (cf. `futures::task::AtomicWaker`); the degenerate
   1-waiter case of `WakerQueueLock`. A lighter building block for oneshot / single-consumer structures.
 
