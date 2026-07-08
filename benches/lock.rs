@@ -1,6 +1,7 @@
 use std::hint::black_box;
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 
+use async_std::sync::{Mutex as AsMutex, RwLock as AsRwLock};
 use criterion::{Criterion, criterion_group, criterion_main};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::sync::{Mutex as TkMutex, RwLock as TkRwLock};
@@ -58,6 +59,14 @@ fn bench_uncontended(c: &mut Criterion) {
     });
     group.bench_function("tokio::RwLock", |b| {
         let m = TkRwLock::new(Payload(0));
+        b.to_async(&rt).iter(|| async { black_box(m.write().await.0 += 1) });
+    });
+    group.bench_function("async-std::Mutex", |b| {
+        let m = AsMutex::new(Payload(0));
+        b.to_async(&rt).iter(|| async { black_box(m.lock().await.0 += 1) });
+    });
+    group.bench_function("async-std::RwLock", |b| {
+        let m = AsRwLock::new(Payload(0));
         b.to_async(&rt).iter(|| async { black_box(m.write().await.0 += 1) });
     });
     group.bench_function("z_sync::Lock16 (Async)", |b| {
@@ -157,6 +166,12 @@ fn bench_read_only(c: &mut Criterion) {
     bench_async!(group, "tokio::RwLock", &rt, TkRwLock::new(Payload(0)), |_i, m| black_box(
         m.read().await.0
     ));
+    bench_async!(group, "async-std::Mutex", &rt, AsMutex::new(Payload(0)), |_i, m| black_box(
+        m.lock().await.0
+    ));
+    bench_async!(group, "async-std::RwLock", &rt, AsRwLock::new(Payload(0)), |_i, m| black_box(
+        m.read().await.0
+    ));
     bench_async!(
         group,
         "z_sync::Lock16 (Async)",
@@ -212,6 +227,12 @@ fn bench_write_only(c: &mut Criterion) {
         m.lock().await.0 += 1
     ));
     bench_async!(group, "tokio::RwLock", &rt, TkRwLock::new(Payload(0)), |_i, m| black_box(
+        m.write().await.0 += 1
+    ));
+    bench_async!(group, "async-std::Mutex", &rt, AsMutex::new(Payload(0)), |_i, m| black_box(
+        m.lock().await.0 += 1
+    ));
+    bench_async!(group, "async-std::RwLock", &rt, AsRwLock::new(Payload(0)), |_i, m| black_box(
         m.write().await.0 += 1
     ));
     bench_async!(
@@ -310,6 +331,20 @@ fn bench_read_heavy(c: &mut Criterion) {
             black_box(m.read().await.0);
         }
     });
+    bench_async!(group, "async-std::Mutex", &rt, AsMutex::new(Payload(0)), |i, m| {
+        if i % 10 == 0 {
+            black_box(m.lock().await.0 += 1);
+        } else {
+            black_box(m.lock().await.0);
+        }
+    });
+    bench_async!(group, "async-std::RwLock", &rt, AsRwLock::new(Payload(0)), |i, m| {
+        if i % 10 == 0 {
+            black_box(m.write().await.0 += 1);
+        } else {
+            black_box(m.read().await.0);
+        }
+    });
     bench_async!(group, "z_sync::Lock32 (Async)", &rt, ZLock32::new(Payload(0)), |i, m| {
         if i % 10 == 0 {
             black_box(m.write_async().await.0 += 1);
@@ -386,6 +421,20 @@ fn bench_write_heavy(c: &mut Criterion) {
         }
     });
     bench_async!(group, "tokio::RwLock", &rt, TkRwLock::new(Payload(0)), |i, m| {
+        if i % 10 != 0 {
+            black_box(m.write().await.0 += 1);
+        } else {
+            black_box(m.read().await.0);
+        }
+    });
+    bench_async!(group, "async-std::Mutex", &rt, AsMutex::new(Payload(0)), |i, m| {
+        if i % 10 != 0 {
+            black_box(m.lock().await.0 += 1);
+        } else {
+            black_box(m.lock().await.0);
+        }
+    });
+    bench_async!(group, "async-std::RwLock", &rt, AsRwLock::new(Payload(0)), |i, m| {
         if i % 10 != 0 {
             black_box(m.write().await.0 += 1);
         } else {

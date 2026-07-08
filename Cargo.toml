@@ -35,6 +35,10 @@ harness = false
 name = "barrier"
 harness = false
 
+[[bench]]
+name = "condvar"
+harness = false
+
 [features]
 default = ["std", "thin-vec"]
 std = ["dep:parking_lot_core"]
@@ -62,3 +66,4 @@ parking_lot = "0.12"
 futures = "0.3"
 async-broadcast = "0.7"
 once_cell = "1"
+async-std = { version = "1.13.2", features = ["unstable"] }

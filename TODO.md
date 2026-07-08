@@ -41,9 +41,11 @@ crate offers a fast *both* in one place.
 
 ## Tier 2 — specialised but on-theme
 
-- [ ] **`Condvar`** — a real condition-variable API pairing with `Lock` guards (`wait(guard)` /
-  `wait_async(guard)`) instead of hand-rolled `Notify` + re-check. The listener's snapshot-then-recheck
-  epoch model already avoids lost wakeups — the hard part of a correct condvar.
+- [x] **`Condvar`** — a real condition-variable API pairing with `Lock` write guards (`wait(guard)` /
+  `wait_async(guard)`, plus `wait_while` / `wait_while_async` and `notify_one` / `notify_all`) instead
+  of hand-rolled `Notify` + re-check. The listener is registered before the guard is released, so the
+  epoch snapshot-then-recheck model rules out lost wakeups. Blocking and async waiters share one
+  condvar. Benched vs `std` and `parking_lot`.
 - [ ] **Upgradable read guard on `Lock`** — `upgradable_read()` → `upgrade()` (parking_lot parity).
   Reader/writer counts are already in the packed word; mostly a new guard type + one state transition.
 - [ ] **`SeqLock`** — lock-free reads for small `Copy`, read-mostly data (config snapshots, counters).
