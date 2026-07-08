@@ -1365,11 +1365,11 @@ impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Futu
                     }
                 } else {
                     this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                    this.lock.add_write_waker(Ordering::SeqCst);
+                    this.lock.add_write_waker(Ordering::Release);
                 }
             } else {
                 this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                this.lock.add_write_waker(Ordering::SeqCst);
+                this.lock.add_write_waker(Ordering::Release);
             }
         }
 
@@ -1452,11 +1452,11 @@ impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Futu
                     }
                 } else {
                     this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                    this.lock.add_write_waker(Ordering::SeqCst);
+                    this.lock.add_write_waker(Ordering::Release);
                 }
             } else {
                 this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                this.lock.add_write_waker(Ordering::SeqCst);
+                this.lock.add_write_waker(Ordering::Release);
             }
         }
 
