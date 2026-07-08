@@ -7,7 +7,7 @@ pub trait NotifyState: Sized + Copy + Clone + PartialEq + Eq {
 
     type Wakers: Eq + Ord + NumCast + ConstZero + ConstOne;
     type Parked: Eq + Ord + NumCast + ConstZero + ConstOne;
-    type Epoch: core::fmt::Debug + Eq + Ord + NumCast + Unpin;
+    type Epoch: core::fmt::Debug + Copy + Eq + Ord + NumCast + Unpin;
 
     const INITIAL_ATOMIC: Self::Atomic;
 
@@ -17,9 +17,20 @@ pub trait NotifyState: Sized + Copy + Clone + PartialEq + Eq {
     fn parked(self) -> Self::Parked;
     fn has_listeners(self) -> bool;
 
+    // --- State Mutations (Pure) ---
+    /// Replaces the epoch field, leaving the waker/parked counts untouched.
+    fn with_epoch(self, epoch: Self::Epoch) -> Self;
+
     // --- Atomic Operations ---
     fn atomic_load(atomic: &Self::Atomic, order: Ordering) -> Self;
     fn atomic_inc_epoch(atomic: &Self::Atomic, order: Ordering) -> Self;
+    fn atomic_compare_exchange_weak(
+        atomic: &Self::Atomic,
+        current: Self,
+        new: Self,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Self, Self>;
 
     fn atomic_add_parkers(atomic: &Self::Atomic, n: Self::Parked, order: Ordering);
     fn atomic_sub_parkers(atomic: &Self::Atomic, n: Self::Parked, order: Ordering);
@@ -81,8 +92,11 @@ macro_rules! atomic_notify_state {
             #[inline(always)] fn parked(self) -> Self::Parked { ((self.0 & Self::PARKED_MASK) >> Self::PARKER_SHIFT) as Self::Parked }
             #[inline(always)] fn has_listeners(self) -> bool { (self.0 & Self::LISTENERS_MASK) != 0 }
 
+            #[inline(always)] fn with_epoch(self, epoch: Self::Epoch) -> Self { Self((self.0 & !Self::EPOCH_MASK) | (((epoch as $prim_ty) << Self::EPOCH_SHIFT) & Self::EPOCH_MASK)) }
+
             #[inline(always)] fn atomic_load(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.load(order)) }
             #[inline(always)] fn atomic_inc_epoch(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_add(1 << Self::EPOCH_SHIFT, order)) }
+            #[inline(always)] fn atomic_compare_exchange_weak(atomic: &Self::Atomic, current: Self, new: Self, success: Ordering, failure: Ordering) -> Result<Self, Self> { atomic.compare_exchange_weak(current.0, new.0, success, failure).map(Self).map_err(Self) }
 
             #[inline(always)] fn atomic_add_parkers(atomic: &Self::Atomic, n: Self::Parked, order: Ordering) { atomic.fetch_add((n as $prim_ty) << Self::PARKER_SHIFT, order); }
             #[inline(always)] fn atomic_sub_parkers(atomic: &Self::Atomic, n: Self::Parked, order: Ordering) { atomic.fetch_sub((n as $prim_ty) << Self::PARKER_SHIFT, order); }

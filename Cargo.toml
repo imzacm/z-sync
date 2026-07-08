@@ -27,6 +27,10 @@ harness = false
 name = "watch"
 harness = false
 
+[[bench]]
+name = "once"
+harness = false
+
 [features]
 default = ["std", "thin-vec"]
 std = ["dep:parking_lot_core"]
@@ -53,3 +57,4 @@ event-listener = "5.4"
 parking_lot = "0.12"
 futures = "0.3"
 async-broadcast = "0.7"
+once_cell = "1"

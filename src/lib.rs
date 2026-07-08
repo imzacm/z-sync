@@ -10,6 +10,7 @@ pub mod channels;
 pub mod lock;
 pub mod notify;
 pub mod observable_lock;
+pub mod once;
 pub mod park_strategy;
 pub mod semaphore;
 pub mod waker_queue;
@@ -37,6 +38,7 @@ pub use self::notify::{
     NotifyStateU64,
 };
 pub use self::observable_lock::ObservableLock;
+pub use self::once::{Lazy, Once, OnceCell};
 pub use self::park_strategy::ParkStrategy;
 pub use self::semaphore::{
     Semaphore, Semaphore16, Semaphore16Boxed, Semaphore16Inline, Semaphore32, Semaphore32Boxed,

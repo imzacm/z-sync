@@ -143,8 +143,8 @@ impl<T> Broadcast<T> {
     }
 }
 
-/// The sending half of a [`Broadcast`], generic over the [`Holder`] `H`. Clone to send from multiple
-/// places. See the [`RefSender`] / [`ArcSender`] / [`RcSender`] aliases.
+/// The sending half of a [`Broadcast`], generic over the [`Holder`] `H`. Clone to send from
+/// multiple places. See the [`RefSender`] / [`ArcSender`] / [`RcSender`] aliases.
 pub struct Sender<T, H: Holder<Broadcast<T>> = Arc<Broadcast<T>>> {
     channel: H,
     _marker: PhantomData<fn() -> T>,
@@ -219,8 +219,8 @@ impl<T, H: Holder<Broadcast<T>>> Drop for Sender<T, H> {
 }
 
 impl<T: Clone, H: Holder<Broadcast<T>>> Receiver<T, H> {
-    /// Reads the next message if one is available. Split fields so a listener borrowing `channel` can
-    /// be held across the check without conflicting with the mutable `next` borrow.
+    /// Reads the next message if one is available. Split fields so a listener borrowing `channel`
+    /// can be held across the check without conflicting with the mutable `next` borrow.
     fn poll_next(channel: &Broadcast<T>, next: &mut u64) -> Result<Option<T>, TryRecvError> {
         let tail = channel.tail.load(Ordering::Acquire);
 

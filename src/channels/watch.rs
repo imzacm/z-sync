@@ -1,9 +1,9 @@
 //! A watch channel: a single latest value observed by many receivers.
 //!
 //! The state lives in a standalone [`Watch`] the caller owns; [`Watch::split`] yields the borrowed
-//! [`Sender`] and a first [`Receiver`] (clone or [`Sender::subscribe`] for more). The value lives in
-//! a [`Lock`](crate::Lock) and change notifications reuse [`Notify`](crate::Notify), so receivers
-//! can wait from blocking or async code.
+//! [`Sender`] and a first [`Receiver`] (clone or [`Sender::subscribe`] for more). The value lives
+//! in a [`Lock`](crate::Lock) and change notifications reuse [`Notify`](crate::Notify), so
+//! receivers can wait from blocking or async code.
 
 use alloc::rc::Rc;
 use alloc::sync::Arc;
@@ -150,8 +150,8 @@ impl<T, H: Holder<Watch<T>>> Sender<T, H> {
         {
             let mut guard = self.channel.value.write();
             f(&mut guard);
-            // Bump the version while the write lock is held so readers never observe a value that is
-            // newer than the version they read.
+            // Bump the version while the write lock is held so readers never observe a value that
+            // is newer than the version they read.
             self.channel.version.fetch_add(1, Ordering::Release);
         }
         self.channel.notify.notify(usize::MAX);
@@ -215,8 +215,9 @@ impl<T, H: Holder<Watch<T>>> Receiver<T, H> {
         }
     }
 
-    /// Checks for a change, updating the seen version. Split fields so a listener borrowing `channel`
-    /// can be held across the check without conflicting with the mutable `seen` borrow.
+    /// Checks for a change, updating the seen version. Split fields so a listener borrowing
+    /// `channel` can be held across the check without conflicting with the mutable `seen`
+    /// borrow.
     fn poll_changed(channel: &Watch<T>, seen: &mut u64) -> Option<Result<(), RecvError>> {
         let version = channel.version.load(Ordering::Acquire);
         if version != *seen {
