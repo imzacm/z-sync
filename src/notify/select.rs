@@ -1,6 +1,9 @@
+#[cfg(feature = "std")]
 use core::pin::Pin;
+#[cfg(feature = "std")]
 use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 
+#[cfg(feature = "std")]
 use parking_lot_core::{DEFAULT_PARK_TOKEN, DEFAULT_UNPARK_TOKEN};
 
 use super::NotifyListener;
@@ -30,35 +33,55 @@ pub fn select_blocking(listeners: &mut [NotifyListener<'_>]) -> Option<usize> {
     // Key is the address of the `listeners` variable (not the slice), which is unique to this
     // scope.
     let key = core::ptr::from_ref(&listeners) as usize;
-    let waker = create_waker(key);
-    let mut cx = Context::from_waker(&waker);
 
-    loop {
-        // This registers our thread-unparking waker in the Notify's WakerQueue.
-        for (index, listener) in listeners.iter_mut().enumerate() {
-            if Pin::new(listener).poll(&mut cx).is_ready() {
-                return Some(index);
+    // Without `std` there is no thread parking, so spin until a listener fires. `is_notified` is a
+    // plain epoch read, so no async-waker registration is needed to observe the notification.
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = key;
+        loop {
+            for (index, listener) in listeners.iter().enumerate() {
+                if listener.is_notified() {
+                    return Some(index);
+                }
             }
+            core::hint::spin_loop();
         }
+    }
 
-        // We use a validation closure to ensure we don't sleep if a notification arrived between
-        // the poll and the park call.
-        unsafe {
-            parking_lot_core::park(
-                key,
-                || {
-                    // Validation: if any listener became ready, don't sleep.
-                    !listeners.iter().any(|l| l.is_notified())
-                },
-                || {},
-                |_, _| {},
-                DEFAULT_PARK_TOKEN,
-                None,
-            );
+    #[cfg(feature = "std")]
+    {
+        let waker = create_waker(key);
+        let mut cx = Context::from_waker(&waker);
+
+        loop {
+            // This registers our thread-unparking waker in the Notify's WakerQueue.
+            for (index, listener) in listeners.iter_mut().enumerate() {
+                if Pin::new(listener).poll(&mut cx).is_ready() {
+                    return Some(index);
+                }
+            }
+
+            // We use a validation closure to ensure we don't sleep if a notification arrived between
+            // the poll and the park call.
+            unsafe {
+                parking_lot_core::park(
+                    key,
+                    || {
+                        // Validation: if any listener became ready, don't sleep.
+                        !listeners.iter().any(|l| l.is_notified())
+                    },
+                    || {},
+                    |_, _| {},
+                    DEFAULT_PARK_TOKEN,
+                    None,
+                );
+            }
         }
     }
 }
 
+#[cfg(feature = "std")]
 fn create_waker(key: usize) -> Waker {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, |_| {});
 
