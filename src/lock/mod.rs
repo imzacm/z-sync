@@ -305,6 +305,39 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
         WriteFuture { lock: self, waker_node_ticket: None }
     }
 
+    /// Takes the read lock, copies the value out, and releases — a convenience for `Copy` payloads.
+    ///
+    /// Unlike [`SeqLock`](crate::SeqLock), this still acquires the read lock (and so momentarily
+    /// blocks writers); it is *not* a lock-free read. Reach for `SeqLock` when readers must never
+    /// block writers.
+    #[inline]
+    pub fn read_copy(&self) -> T
+    where
+        T: Copy,
+    {
+        *self.read()
+    }
+
+    /// Attempts to take the read lock and copy the value out without blocking. Returns `None` if a
+    /// writer holds or is waiting for the lock.
+    #[inline]
+    pub fn try_read_copy(&self) -> Option<T>
+    where
+        T: Copy,
+    {
+        self.try_read().map(|guard| *guard)
+    }
+
+    /// Awaits the read lock, copies the value out, and releases. The async counterpart of
+    /// [`read_copy`](Lock::read_copy).
+    #[inline]
+    pub async fn read_copy_async(&self) -> T
+    where
+        T: Copy,
+    {
+        *self.read_async().await
+    }
+
     #[inline(always)]
     fn common_dropped<const IS_READER: bool>(&self) {
         let state = if IS_READER {
@@ -1738,6 +1771,17 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
+    fn read_copy_returns_value() {
+        let lock = Lock::new(42u32);
+        assert_eq!(lock.read_copy(), 42);
+        assert_eq!(lock.try_read_copy(), Some(42));
+
+        let _w = lock.write();
+        // A held writer blocks the non-blocking copy.
+        assert_eq!(lock.try_read_copy(), None);
+    }
+
+    #[test]
     fn upgradable_allows_shared_readers_excludes_writers_and_upgraders() {
         let lock = Lock::new(1u32);
         let up = lock.upgradable_read();
@@ -2162,6 +2206,12 @@ mod tests {
         // The upgradable lock was released on cancellation, so the lock is fully free.
         assert!(lock.try_write().is_some());
         assert_eq!(lock.load_state(Ordering::Relaxed), crate::LockStateU64::empty());
+    }
+
+    #[tokio::test]
+    async fn read_copy_async_returns_value() {
+        let lock = Lock::new(7u32);
+        assert_eq!(lock.read_copy_async().await, 7);
     }
 
     #[tokio::test]

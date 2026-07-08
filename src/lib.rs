@@ -15,6 +15,7 @@ pub mod observable_lock;
 pub mod once;
 pub mod park_strategy;
 pub mod semaphore;
+pub mod seqlock;
 pub mod waker_queue;
 pub mod waker_storage;
 
@@ -56,4 +57,5 @@ pub use self::semaphore::{
     Semaphore32Inline, Semaphore64, Semaphore64Boxed, Semaphore64Inline, SemaphoreState,
     SemaphoreStateU16, SemaphoreStateU32, SemaphoreStateU64,
 };
+pub use self::seqlock::{SeqLock, SeqLockWriteGuard};
 pub use self::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
