@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod barrier;
 pub mod channels;
 pub mod lock;
 pub mod notify;
@@ -28,6 +29,11 @@ pub trait Holder<T: ?Sized>: core::ops::Deref<Target = T> + Clone {}
 
 impl<T: ?Sized, H: core::ops::Deref<Target = T> + Clone> Holder<T> for H {}
 
+pub use self::barrier::{
+    Barrier, Barrier16, Barrier16Boxed, Barrier16Inline, Barrier32, Barrier32Boxed,
+    Barrier32Inline, Barrier64, Barrier64Boxed, Barrier64Inline, BarrierState, BarrierStateU16,
+    BarrierStateU32, BarrierStateU64, BarrierWaitResult,
+};
 pub use self::lock::{
     Lock, Lock16, Lock16Boxed, Lock16Inline, Lock32, Lock32Boxed, Lock32Inline, Lock64,
     Lock64Boxed, Lock64Inline, LockState, LockStateU16, LockStateU32, LockStateU64,

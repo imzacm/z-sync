@@ -31,6 +31,10 @@ harness = false
 name = "once"
 harness = false
 
+[[bench]]
+name = "barrier"
+harness = false
+
 [features]
 default = ["std", "thin-vec"]
 std = ["dep:parking_lot_core"]
