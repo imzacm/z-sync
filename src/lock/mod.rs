@@ -137,13 +137,10 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
     }
 
     pub fn try_read(&self) -> Option<ReadGuard<'_, T, S, P, W>> {
-        // Fast test: Don't dirty the cache line if a writer is waiting/active.
-        if cfg!(not(any(target_arch = "x86", target_arch = "x86_64")))
-            && self.load_state(Ordering::Relaxed).has_any_write_state()
-        {
-            return None;
-        }
-
+        // Optimistically take a reader slot, then back out if a writer holds or awaits the lock.
+        // (A non-x86-only pre-check load used to gate this on `has_any_write_state`; it was removed
+        // because under read contention it only added traffic to the already-hot state line, and
+        // x86 has always run this path without it.)
         let old_state = self.add_reader(Ordering::Acquire);
         // This will drop on None, so we don't need to worry about it.
         let guard = ReadGuard { lock: self };
