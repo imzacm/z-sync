@@ -7,6 +7,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod atomic_waker;
+pub mod backoff;
 pub mod barrier;
 pub mod channels;
 pub mod condvar;
@@ -33,6 +34,7 @@ pub trait Holder<T: ?Sized>: core::ops::Deref<Target = T> + Clone {}
 impl<T: ?Sized, H: core::ops::Deref<Target = T> + Clone> Holder<T> for H {}
 
 pub use self::atomic_waker::AtomicWaker;
+pub use self::backoff::{Backoff, SpinWait};
 pub use self::barrier::{
     Barrier, Barrier16, Barrier16Boxed, Barrier16Inline, Barrier32, Barrier32Boxed,
     Barrier32Inline, Barrier64, Barrier64Boxed, Barrier64Inline, BarrierState, BarrierStateU16,

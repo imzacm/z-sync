@@ -12,6 +12,7 @@ use num_traits::{ConstZero, NumCast};
 
 pub use self::state::*;
 use crate::NotifyState;
+use crate::backoff::SpinWait;
 use crate::park_strategy::{DefaultParkStrategy, ParkStrategy};
 use crate::waker_queue::{WakerQueueLock, WakerTicket};
 use crate::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
@@ -49,22 +50,8 @@ pub type Lock64<T, P = DefaultParkStrategy> = Lock64Boxed<T, P>;
 
 pub(crate) const ASYNC_CAPACITY: usize = 4;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const READ_SPIN_MAX: usize = 64;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const WRITE_SPIN_MAX: usize = 64;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const SPIN_CAP: usize = 32;
-
-// Non-x86 spin tuning, aligned with the x86 values (more spinning, and no post-spin `yield_now`) on
-// the hypothesis that high-performance Arm cores behave more like x86 here than like weak/in-order
-// cores. Sweep individually if results are mixed.
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const READ_SPIN_MAX: usize = 64;
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const WRITE_SPIN_MAX: usize = 64;
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const SPIN_CAP: usize = 32;
+// The optimistic pre-park spinning is driven by [`SpinWait`], which carries the arch-tuned burst
+// cap and round budget these acquire loops were tuned to.
 
 /// An efficient multi-purpose blocking and async lock supporting Mutex and RwLock style usage.
 ///
@@ -156,8 +143,8 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
     }
 
     fn spin_try_read(&self) -> Option<ReadGuard<'_, T, S, P, W>> {
-        let mut backoff = 1;
-        for _ in 0..READ_SPIN_MAX {
+        let mut spin = SpinWait::new();
+        loop {
             let state = self.load_state(Ordering::Relaxed);
 
             if !state.has_any_write_state()
@@ -165,15 +152,10 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
             {
                 return Some(guard);
             }
-            for _ in 0..backoff {
-                core::hint::spin_loop();
-            }
-            if backoff < SPIN_CAP {
-                backoff <<= 1;
+            if !spin.spin() {
+                return None;
             }
         }
-
-        None
     }
 
     pub fn try_write(&self) -> Option<WriteGuard<'_, T, S, P, W>> {
@@ -209,8 +191,8 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
     }
 
     fn spin_try_write(&self) -> Option<WriteGuard<'_, T, S, P, W>> {
-        let mut backoff = 1;
-        for _ in 0..WRITE_SPIN_MAX {
+        let mut spin = SpinWait::new();
+        loop {
             let state = self.load_state(Ordering::Relaxed);
 
             if !state.has_readers_or_writers()
@@ -220,15 +202,10 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
                 return Some(guard);
             }
 
-            for _ in 0..backoff {
-                core::hint::spin_loop();
-            }
-            if backoff < SPIN_CAP {
-                backoff <<= 1;
+            if !spin.spin() {
+                return None;
             }
         }
-
-        None
     }
 
     #[inline(always)]
@@ -544,8 +521,8 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
     }
 
     fn spin_try_upgradable_read(&self) -> Option<UpgradableReadGuard<'_, T, S, P, W>> {
-        let mut backoff = 1;
-        for _ in 0..WRITE_SPIN_MAX {
+        let mut spin = SpinWait::new();
+        loop {
             let state = self.load_state(Ordering::Relaxed);
             if !state.has_any_write_state()
                 && !state.has_upgradable()
@@ -553,15 +530,10 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
             {
                 return Some(guard);
             }
-            for _ in 0..backoff {
-                core::hint::spin_loop();
-            }
-            if backoff < SPIN_CAP {
-                backoff <<= 1;
+            if !spin.spin() {
+                return None;
             }
         }
-
-        None
     }
 
     /// Acquires an upgradable read lock, blocking until no writer or other upgrader holds it.
@@ -632,17 +604,14 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
         // so that the existing readers can drain to zero.
         self.add_write_parker(Ordering::Relaxed);
 
-        let mut backoff = 1;
-        for _ in 0..WRITE_SPIN_MAX {
+        let mut spin = SpinWait::new();
+        loop {
             if self.try_upgrade_inner() {
                 self.sub_write_parker(Ordering::Relaxed);
                 return WriteGuard { lock: self };
             }
-            for _ in 0..backoff {
-                core::hint::spin_loop();
-            }
-            if backoff < SPIN_CAP {
-                backoff <<= 1;
+            if !spin.spin() {
+                break;
             }
         }
 

@@ -24,8 +24,7 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
-/// Backoff cap for the (rare) case of writers contending with each other.
-const WRITE_SPIN_CAP: usize = 64;
+use crate::backoff::Backoff;
 
 /// A sequence lock over a `Copy` value, providing lock-free reads and serialised writes.
 ///
@@ -81,7 +80,7 @@ impl<T> SeqLock<T> {
     #[cold]
     #[inline(never)]
     fn write_contended(&self) -> SeqLockWriteGuard<'_, T> {
-        let mut backoff = 1;
+        let mut backoff = Backoff::new();
         loop {
             let seq = self.seq.load(Ordering::Relaxed);
             if (seq & 1) == 0
@@ -98,12 +97,7 @@ impl<T> SeqLock<T> {
                 fence(Ordering::Release);
                 return SeqLockWriteGuard { lock: self, seq: seq.wrapping_add(1) };
             }
-            for _ in 0..backoff {
-                core::hint::spin_loop();
-            }
-            if backoff < WRITE_SPIN_CAP {
-                backoff <<= 1;
-            }
+            backoff.spin();
         }
     }
 
