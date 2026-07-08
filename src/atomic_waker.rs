@@ -71,7 +71,9 @@ impl AtomicWaker {
                         Err(actual) => {
                             debug_assert_eq!(actual, REGISTERING | WAKING);
                             let woken = (*self.waker.get()).take();
-                            self.state.swap(WAITING, Ordering::AcqRel);
+                            // We hold both bits exclusively (a racing `take` no-ops, a racing
+                            // `register` can't enter), so a plain store clears them.
+                            self.state.store(WAITING, Ordering::Release);
                             if let Some(woken) = woken {
                                 woken.wake();
                             }
@@ -100,9 +102,12 @@ impl AtomicWaker {
     pub fn take(&self) -> Option<Waker> {
         match self.state.fetch_or(WAKING, Ordering::AcqRel) {
             WAITING => {
-                // We won the WAKING claim with no registration in flight: the slot is ours.
+                // We won the WAKING claim with no registration in flight: the slot is ours. No
+                // other bit can be set during the WAKING window (a racing `register` can't CAS
+                // WAITING→REGISTERING, a racing `take` no-ops), so a plain store clears WAKING more
+                // cheaply than a `fetch_and`.
                 let waker = unsafe { (*self.waker.get()).take() };
-                self.state.fetch_and(!WAKING, Ordering::Release);
+                self.state.store(WAITING, Ordering::Release);
                 waker
             }
             // REGISTERING: the registering side will observe our WAKING bit and deliver.
