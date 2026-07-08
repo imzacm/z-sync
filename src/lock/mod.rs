@@ -4,6 +4,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
+use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll, Waker};
 
@@ -416,6 +417,34 @@ impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Lock<T, 
 
         S::atomic_fetch_sub_batch(&self.state, batch_sub, Ordering::Release);
     }
+
+    /// Atomically converts a held write lock into a read lock (`downgrade`). The caller must own
+    /// the sole writer; on return a single reader is held. Parked/async readers are woken since
+    /// shared reads are now permitted, while writers stay blocked (we still hold a read lock).
+    fn write_to_read(&self) {
+        let mut state = self.load_state(Ordering::Relaxed);
+        loop {
+            let new = state.sub_writer_state().add_reader_state();
+            match S::atomic_compare_exchange_weak(
+                &self.state,
+                state,
+                new,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => state = v,
+            }
+        }
+
+        let state = self.load_state(Ordering::Acquire);
+        if state.read_wakers() > S::ReadWakers::ZERO {
+            self.wake_all_in_queue::<true>();
+        }
+        if state.read_parked() > S::ReadParked::ZERO {
+            P::unpark_all(self.reader_parking_key());
+        }
+    }
 }
 
 impl<T, S: LockState, P, W> Lock<T, S, P, W> {
@@ -516,6 +545,25 @@ impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
         let value = unsafe { &*guard.lock.data.get() };
         MappedReadGuard { _guard: guard, value: f(value) }
     }
+
+    /// Like [`map`](ReadGuard::map), but `f` may decline the projection by returning `None`, in
+    /// which case the original guard is handed back unchanged.
+    #[allow(clippy::type_complexity)]
+    #[inline(always)]
+    pub fn try_map<U, F>(
+        guard: ReadGuard<'a, T, S, P, W>,
+        f: F,
+    ) -> Result<MappedReadGuard<'a, T, U, S, P, W>, ReadGuard<'a, T, S, P, W>>
+    where
+        F: FnOnce(&T) -> Option<&U>,
+        U: ?Sized,
+    {
+        let value = unsafe { &*guard.lock.data.get() };
+        match f(value) {
+            Some(value) => Ok(MappedReadGuard { _guard: guard, value }),
+            None => Err(guard),
+        }
+    }
 }
 
 impl<T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
@@ -549,6 +597,36 @@ pub struct MappedReadGuard<
     value: &'a U,
 }
 
+impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
+    MappedReadGuard<'a, T, U, S, P, W>
+{
+    /// Projects the already-mapped reference further to one of its parts.
+    #[inline(always)]
+    pub fn map<V, F>(guard: Self, f: F) -> MappedReadGuard<'a, T, V, S, P, W>
+    where
+        F: FnOnce(&U) -> &V,
+        V: ?Sized,
+    {
+        let value = f(guard.value);
+        MappedReadGuard { _guard: guard._guard, value }
+    }
+
+    /// Like [`map`](MappedReadGuard::map), but `f` may decline by returning `None`, handing the
+    /// original mapped guard back unchanged.
+    #[allow(clippy::type_complexity)]
+    #[inline(always)]
+    pub fn try_map<V, F>(guard: Self, f: F) -> Result<MappedReadGuard<'a, T, V, S, P, W>, Self>
+    where
+        F: FnOnce(&U) -> Option<&V>,
+        V: ?Sized,
+    {
+        match f(guard.value) {
+            Some(value) => Ok(MappedReadGuard { _guard: guard._guard, value }),
+            None => Err(guard),
+        }
+    }
+}
+
 impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Deref
     for MappedReadGuard<'a, T, U, S, P, W>
 {
@@ -556,6 +634,97 @@ impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPA
 
     fn deref(&self) -> &U {
         self.value
+    }
+}
+
+/// A [`WriteGuard`] projected to part of the guarded value (see [`WriteGuard::map`]). Derefs
+/// mutably to that part and holds the write lock until dropped.
+#[derive(Debug)]
+pub struct MappedWriteGuard<
+    'a,
+    T,
+    U: ?Sized,
+    S: LockState,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+> {
+    _guard: WriteGuard<'a, T, S, P, W>,
+    value: NonNull<U>,
+}
+
+// SAFETY: a `MappedWriteGuard` grants unique access to a `U` living inside the lock. Sending it
+// transfers that unique access (sound when `U: Send` and the write guard itself is `Send`, i.e.
+// `T: Send`); sharing `&MappedWriteGuard` only ever exposes `&U` (sound when `U: Sync`).
+unsafe impl<
+    'a,
+    T: Send,
+    U: ?Sized + Send,
+    S: LockState,
+    P: ParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY>,
+> Send for MappedWriteGuard<'a, T, U, S, P, W>
+{
+}
+unsafe impl<
+    'a,
+    T: Send,
+    U: ?Sized + Sync,
+    S: LockState,
+    P: ParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY>,
+> Sync for MappedWriteGuard<'a, T, U, S, P, W>
+{
+}
+
+impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
+    MappedWriteGuard<'a, T, U, S, P, W>
+{
+    /// Projects the already-mapped reference further to one of its parts.
+    #[inline(always)]
+    pub fn map<V, F>(mut guard: Self, f: F) -> MappedWriteGuard<'a, T, V, S, P, W>
+    where
+        F: FnOnce(&mut U) -> &mut V,
+        V: ?Sized,
+    {
+        let value = NonNull::from(f(&mut *guard));
+        MappedWriteGuard { _guard: guard._guard, value }
+    }
+
+    /// Like [`map`](MappedWriteGuard::map), but `f` may decline by returning `None`, handing the
+    /// original mapped guard back unchanged.
+    #[allow(clippy::type_complexity)]
+    #[inline(always)]
+    pub fn try_map<V, F>(mut guard: Self, f: F) -> Result<MappedWriteGuard<'a, T, V, S, P, W>, Self>
+    where
+        F: FnOnce(&mut U) -> Option<&mut V>,
+        V: ?Sized,
+    {
+        // Compute the projection through a temporary borrow; only commit the move on success.
+        match f(unsafe { guard.value.as_mut() }) {
+            Some(value) => {
+                let value = NonNull::from(value);
+                Ok(MappedWriteGuard { _guard: guard._guard, value })
+            }
+            None => Err(guard),
+        }
+    }
+}
+
+impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Deref
+    for MappedWriteGuard<'a, T, U, S, P, W>
+{
+    type Target = U;
+
+    fn deref(&self) -> &U {
+        unsafe { self.value.as_ref() }
+    }
+}
+
+impl<'a, T, U: ?Sized, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> DerefMut
+    for MappedWriteGuard<'a, T, U, S, P, W>
+{
+    fn deref_mut(&mut self) -> &mut U {
+        unsafe { self.value.as_mut() }
     }
 }
 
@@ -575,6 +744,47 @@ impl<'a, T, S: LockState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>>
 {
     pub(crate) unsafe fn get_lock(guard: &Self) -> &'a Lock<T, S, P, W> {
         guard.lock
+    }
+
+    /// Projects the guarded value to one of its parts, yielding a guard that derefs (mutably) to
+    /// that part while continuing to hold the write lock.
+    #[inline(always)]
+    pub fn map<U, F>(mut guard: Self, f: F) -> MappedWriteGuard<'a, T, U, S, P, W>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+        U: ?Sized,
+    {
+        let value = NonNull::from(f(&mut *guard));
+        MappedWriteGuard { _guard: guard, value }
+    }
+
+    /// Like [`map`](WriteGuard::map), but `f` may decline the projection by returning `None`, in
+    /// which case the original guard is handed back unchanged.
+    #[allow(clippy::type_complexity)]
+    #[inline(always)]
+    pub fn try_map<U, F>(mut guard: Self, f: F) -> Result<MappedWriteGuard<'a, T, U, S, P, W>, Self>
+    where
+        F: FnOnce(&mut T) -> Option<&mut U>,
+        U: ?Sized,
+    {
+        match f(&mut *guard) {
+            Some(value) => {
+                let value = NonNull::from(value);
+                Ok(MappedWriteGuard { _guard: guard, value })
+            }
+            None => Err(guard),
+        }
+    }
+
+    /// Atomically converts this write guard into a read guard without releasing the lock in
+    /// between, so no other writer can interpose. Parked readers are woken.
+    #[inline]
+    pub fn downgrade(self) -> ReadGuard<'a, T, S, P, W> {
+        let lock = self.lock;
+        // We transition the state ourselves; skip the guard's writer-release Drop.
+        core::mem::forget(self);
+        lock.write_to_read();
+        ReadGuard { lock }
     }
 }
 
@@ -947,6 +1157,96 @@ mod tests {
         {
             let _w = lock.write();
         }
+        assert_eq!(lock.load_state(Ordering::Relaxed), crate::LockStateU64::empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // Mapping + downgrade tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn read_guard_map_projects_field() {
+        let lock = Lock::new((7u32, 8u32));
+        let g = ReadGuard::map(lock.read(), |t| &t.1);
+        assert_eq!(*g, 8);
+        // Other readers still allowed while a mapped read guard is held.
+        assert_eq!(lock.read().1, 8);
+    }
+
+    #[test]
+    fn read_guard_try_map_some_and_none() {
+        let lock = Lock::new(Some(5u32));
+        let mapped = ReadGuard::try_map(lock.read(), |t| t.as_ref());
+        assert!(mapped.is_ok());
+        assert_eq!(*mapped.unwrap(), 5);
+
+        let lock2 = Lock::new(None::<u32>);
+        let back = ReadGuard::try_map(lock2.read(), |t| t.as_ref());
+        assert!(back.is_err());
+        // Returned guard still works and releases cleanly.
+        assert!(back.err().unwrap().is_none());
+    }
+
+    #[test]
+    fn mapped_read_guard_further_map() {
+        let lock = Lock::new((1u32, (2u32, 3u32)));
+        let g = ReadGuard::map(lock.read(), |t| &t.1);
+        let g = MappedReadGuard::map(g, |t| &t.1);
+        assert_eq!(*g, 3);
+    }
+
+    #[test]
+    fn write_guard_map_mutates_projection() {
+        let lock = Lock::new((1u32, 2u32));
+        {
+            let mut g = WriteGuard::map(lock.write(), |t| &mut t.1);
+            *g += 40;
+        }
+        assert_eq!(*lock.read(), (1, 42));
+    }
+
+    #[test]
+    fn write_guard_try_map_some_and_none() {
+        let lock = Lock::new(Some(1u32));
+        {
+            let mut g = WriteGuard::try_map(lock.write(), |t| t.as_mut()).ok().unwrap();
+            *g += 9;
+        }
+        assert_eq!(*lock.read(), Some(10));
+
+        let lock2 = Lock::new(None::<u32>);
+        let back = WriteGuard::try_map(lock2.write(), |t| t.as_mut());
+        assert!(back.is_err());
+    }
+
+    #[test]
+    fn mapped_write_guard_further_map() {
+        let lock = Lock::new((0u32, (0u32, 0u32)));
+        {
+            let g = WriteGuard::map(lock.write(), |t| &mut t.1);
+            let mut g = MappedWriteGuard::map(g, |t| &mut t.1);
+            *g = 99;
+        }
+        assert_eq!(*lock.read(), (0, (0, 99)));
+    }
+
+    #[test]
+    fn write_downgrade_yields_read_and_wakes_readers() {
+        let lock = Arc::new(Lock::new(0u32));
+        let mut w = lock.write();
+        *w = 5;
+
+        // A reader that parks while the write lock is held.
+        let lock2 = Arc::clone(&lock);
+        let reader = std::thread::spawn(move || *lock2.read());
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Downgrade hands us a read guard without releasing exclusivity to another writer.
+        let r = w.downgrade();
+        assert_eq!(*r, 5);
+        // The parked reader is woken and observes the downgraded value.
+        assert_eq!(reader.join().unwrap(), 5);
+        drop(r);
         assert_eq!(lock.load_state(Ordering::Relaxed), crate::LockStateU64::empty());
     }
 
