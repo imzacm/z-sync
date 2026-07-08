@@ -201,12 +201,11 @@ macro_rules! atomic_lock_state {
             #[inline(always)] fn atomic_sub_writer(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_sub(1 << Self::W_SHIFT, order)) }
             #[inline(always)] fn atomic_add_reader(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_add(1 << Self::R_SHIFT, order)) }
             #[inline(always)] fn atomic_sub_reader(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_sub(1 << Self::R_SHIFT, order)) }
-            #[inline(always)] fn atomic_sub_upgrader(atomic: &Self::Atomic, order: Ordering) -> Self {
-                let old = atomic.fetch_and(!Self::U_MASK, order);
-                // Required to prevent a releasing thread from missing a waiter that just parked.
-                core::sync::atomic::fence(Ordering::SeqCst);
-                Self(old)
-            }
+            // The `fetch_and` returns the full old word (waiter bits included), which the drop path
+            // uses directly to decide whether to wake — so, like `atomic_sub_reader`/`_writer` in
+            // this packed layout, no separate fence is needed (the split layout needs one because it
+            // loads the waiter word separately).
+            #[inline(always)] fn atomic_sub_upgrader(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_and(!Self::U_MASK, order)) }
 
             #[inline(always)] fn batch_sub_new() -> Self::BatchSub { 0 }
             #[inline(always)] fn batch_sub_read_waker(batch: Self::BatchSub, n: Self::ReadWakers) -> Self::BatchSub { batch + ((n as $prim_ty) << Self::RW_SHIFT) }
