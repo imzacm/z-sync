@@ -36,12 +36,18 @@ pub trait LockState: Sized + Copy + Clone + PartialEq + Eq {
     fn has_write_waiters(self) -> bool;
     fn has_read_waiters(self) -> bool;
     fn has_any_waiters(self) -> bool;
+    /// Whether an upgradable reader currently holds the lock.
+    fn has_upgradable(self) -> bool;
 
     // --- State Mutations (Pure) ---
     fn add_reader_state(self) -> Self;
     fn sub_reader_state(self) -> Self;
     fn add_writer_state(self) -> Self;
     fn sub_writer_state(self) -> Self;
+    /// Sets the upgradable-reader flag (caller has verified it was clear).
+    fn add_upgradable_state(self) -> Self;
+    /// Clears the upgradable-reader flag.
+    fn sub_upgradable_state(self) -> Self;
 
     // --- Atomic Operations ---
     fn atomic_load(atomic: &Self::Atomic, order: Ordering) -> Self;
@@ -65,6 +71,9 @@ pub trait LockState: Sized + Copy + Clone + PartialEq + Eq {
     fn atomic_sub_writer(atomic: &Self::Atomic, order: Ordering) -> Self;
     fn atomic_add_reader(atomic: &Self::Atomic, order: Ordering) -> Self;
     fn atomic_sub_reader(atomic: &Self::Atomic, order: Ordering) -> Self;
+    /// Atomically clears the upgradable-reader flag, returning the previous state. Carries the same
+    /// missed-wakeup fence as the reader/writer release ops.
+    fn atomic_sub_upgrader(atomic: &Self::Atomic, order: Ordering) -> Self;
 
     // --- Batch Subtraction ---
     fn batch_sub_new() -> Self::BatchSub;
@@ -83,7 +92,8 @@ macro_rules! atomic_lock_state {
                 write_wakers: $ww_ty:ty = $ww_bits:expr,
                 write_parked: $wp_ty:ty = $wp_bits:expr,
                 writers: $w_ty:ty = $w_bits:expr,
-                readers: $r_ty:ty = $r_bits:expr $(,)?
+                readers: $r_ty:ty = $r_bits:expr,
+                upgradable: $u_bits:expr $(,)?
             }
         )
     ) => {
@@ -97,9 +107,10 @@ macro_rules! atomic_lock_state {
             pub const WP_SHIFT: $prim_ty = Self::WW_SHIFT + $ww_bits;
             pub const W_SHIFT: $prim_ty = Self::WP_SHIFT + $wp_bits;
             pub const R_SHIFT: $prim_ty = Self::W_SHIFT + $w_bits;
+            pub const U_SHIFT: $prim_ty = Self::R_SHIFT + $r_bits;
 
             const _ASSERT_SIZE: () = assert!(
-                ($rw_bits + $rp_bits + $ww_bits + $wp_bits + $w_bits + $r_bits) <= <$prim_ty>::BITS as $prim_ty,
+                ($rw_bits + $rp_bits + $ww_bits + $wp_bits + $w_bits + $r_bits + $u_bits) <= <$prim_ty>::BITS as $prim_ty,
                 "Total bits specified exceed the capacity of the chosen primitive type."
             );
 
@@ -119,6 +130,7 @@ macro_rules! atomic_lock_state {
             pub const WP_MASK: $prim_ty = Self::mask($wp_bits, Self::WP_SHIFT);
             pub const W_MASK: $prim_ty = Self::mask($w_bits, Self::W_SHIFT);
             pub const R_MASK: $prim_ty = Self::mask($r_bits, Self::R_SHIFT);
+            pub const U_MASK: $prim_ty = Self::mask($u_bits, Self::U_SHIFT);
 
             pub const READERS_AND_WRITERS_MASK: $prim_ty = Self::R_MASK | Self::W_MASK;
             pub const ANY_WRITE_STATE_MASK: $prim_ty = Self::W_MASK | Self::WP_MASK | Self::WW_MASK;
@@ -155,11 +167,14 @@ macro_rules! atomic_lock_state {
             #[inline(always)] fn has_write_waiters(self) -> bool { (self.0 & Self::WRITE_WAITERS_MASK) != 0 }
             #[inline(always)] fn has_read_waiters(self) -> bool { (self.0 & Self::READ_WAITERS_MASK) != 0 }
             #[inline(always)] fn has_any_waiters(self) -> bool { (self.0 & Self::ANY_WAITERS_MASK) != 0 }
+            #[inline(always)] fn has_upgradable(self) -> bool { (self.0 & Self::U_MASK) != 0 }
 
             #[inline(always)] fn add_reader_state(self) -> Self { Self(self.0 + (1 << Self::R_SHIFT)) }
             #[inline(always)] fn sub_reader_state(self) -> Self { Self(self.0 - (1 << Self::R_SHIFT)) }
             #[inline(always)] fn add_writer_state(self) -> Self { Self(self.0 + (1 << Self::W_SHIFT)) }
             #[inline(always)] fn sub_writer_state(self) -> Self { Self(self.0 - (1 << Self::W_SHIFT)) }
+            #[inline(always)] fn add_upgradable_state(self) -> Self { Self(self.0 | Self::U_MASK) }
+            #[inline(always)] fn sub_upgradable_state(self) -> Self { Self(self.0 & !Self::U_MASK) }
 
             #[inline(always)] fn atomic_load(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.load(order)) }
             #[inline(always)] fn atomic_compare_exchange_weak(
@@ -186,6 +201,11 @@ macro_rules! atomic_lock_state {
             #[inline(always)] fn atomic_sub_writer(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_sub(1 << Self::W_SHIFT, order)) }
             #[inline(always)] fn atomic_add_reader(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_add(1 << Self::R_SHIFT, order)) }
             #[inline(always)] fn atomic_sub_reader(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_sub(1 << Self::R_SHIFT, order)) }
+            // The `fetch_and` returns the full old word (waiter bits included), which the drop path
+            // uses directly to decide whether to wake — so, like `atomic_sub_reader`/`_writer` in
+            // this packed layout, no separate fence is needed (the split layout needs one because it
+            // loads the waiter word separately).
+            #[inline(always)] fn atomic_sub_upgrader(atomic: &Self::Atomic, order: Ordering) -> Self { Self(atomic.fetch_and(!Self::U_MASK, order)) }
 
             #[inline(always)] fn batch_sub_new() -> Self::BatchSub { 0 }
             #[inline(always)] fn batch_sub_read_waker(batch: Self::BatchSub, n: Self::ReadWakers) -> Self::BatchSub { batch + ((n as $prim_ty) << Self::RW_SHIFT) }
@@ -206,7 +226,8 @@ macro_rules! split_atomic_lock_state {
         $atomic_vis:vis struct $atomic_struct_name:ident {
             core: $core_atomic_ty:ident($core_prim_ty:ty) {
                 writers: $w_ty:ty = $w_bits:expr,
-                readers: $r_ty:ty = $r_bits:expr $(,)?
+                readers: $r_ty:ty = $r_bits:expr,
+                upgradable: $u_bits:expr $(,)?
             },
             waiters: $wait_atomic_ty:ident($wait_prim_ty:ty) {
                 read_wakers: $rw_ty:ty = $rw_bits:expr,
@@ -241,9 +262,10 @@ macro_rules! split_atomic_lock_state {
             // --- Core Shifts & Masks ---
             pub const W_SHIFT: $core_prim_ty = 0;
             pub const R_SHIFT: $core_prim_ty = Self::W_SHIFT + $w_bits;
+            pub const U_SHIFT: $core_prim_ty = Self::R_SHIFT + $r_bits;
 
             const _ASSERT_CORE_SIZE: () = assert!(
-                ($w_bits + $r_bits) <= <$core_prim_ty>::BITS as $core_prim_ty,
+                ($w_bits + $r_bits + $u_bits) <= <$core_prim_ty>::BITS as $core_prim_ty,
                 "Total bits specified exceed the capacity of the core primitive type."
             );
 
@@ -255,6 +277,7 @@ macro_rules! split_atomic_lock_state {
 
             pub const W_MASK: $core_prim_ty = Self::mask_core($w_bits, Self::W_SHIFT);
             pub const R_MASK: $core_prim_ty = Self::mask_core($r_bits, Self::R_SHIFT);
+            pub const U_MASK: $core_prim_ty = Self::mask_core($u_bits, Self::U_SHIFT);
             pub const READERS_AND_WRITERS_MASK: $core_prim_ty = Self::R_MASK | Self::W_MASK;
 
             // --- Waiter Shifts & Masks ---
@@ -314,11 +337,14 @@ macro_rules! split_atomic_lock_state {
             #[inline(always)] fn has_write_waiters(self) -> bool { (self.waiters & Self::ANY_WRITE_WAITER_MASK) != 0 }
             #[inline(always)] fn has_read_waiters(self) -> bool { (self.waiters & Self::ANY_READ_WAITER_MASK) != 0 }
             #[inline(always)] fn has_any_waiters(self) -> bool { (self.waiters & Self::ANY_WAITERS_MASK) != 0 }
+            #[inline(always)] fn has_upgradable(self) -> bool { (self.core & Self::U_MASK) != 0 }
 
             #[inline(always)] fn add_reader_state(self) -> Self { Self { core: self.core + (1 << Self::R_SHIFT), waiters: self.waiters } }
             #[inline(always)] fn sub_reader_state(self) -> Self { Self { core: self.core - (1 << Self::R_SHIFT), waiters: self.waiters } }
             #[inline(always)] fn add_writer_state(self) -> Self { Self { core: self.core + (1 << Self::W_SHIFT), waiters: self.waiters } }
             #[inline(always)] fn sub_writer_state(self) -> Self { Self { core: self.core - (1 << Self::W_SHIFT), waiters: self.waiters } }
+            #[inline(always)] fn add_upgradable_state(self) -> Self { Self { core: self.core | Self::U_MASK, waiters: self.waiters } }
+            #[inline(always)] fn sub_upgradable_state(self) -> Self { Self { core: self.core & !Self::U_MASK, waiters: self.waiters } }
 
             #[inline(always)] fn atomic_load(atomic: &Self::Atomic, order: Ordering) -> Self {
                 Self {
@@ -392,6 +418,13 @@ macro_rules! split_atomic_lock_state {
                 Self { core: old_core, waiters: atomic.waiters.load(Ordering::Relaxed) }
             }
 
+            #[inline(always)] fn atomic_sub_upgrader(atomic: &Self::Atomic, order: Ordering) -> Self {
+                let old_core = atomic.core.fetch_and(!Self::U_MASK, order);
+                // Required to prevent a releasing thread from missing a waiter that just parked
+                core::sync::atomic::fence(Ordering::SeqCst);
+                Self { core: old_core, waiters: atomic.waiters.load(Ordering::Relaxed) }
+            }
+
             #[inline(always)] fn batch_sub_new() -> Self::BatchSub { 0 }
             #[inline(always)] fn batch_sub_read_waker(batch: Self::BatchSub, n: Self::ReadWakers) -> Self::BatchSub {
                 batch + ((n as $wait_prim_ty) << Self::RW_SHIFT)
@@ -415,7 +448,8 @@ atomic_lock_state!(pub struct LockStateU64(
         write_wakers: u8 = 9,
         write_parked: u8 = 9,
         writers: u8 = 1,
-        readers: u16 = 20,
+        readers: u16 = 19,
+        upgradable: 1,
     }
 ));
 
@@ -426,7 +460,8 @@ atomic_lock_state!(pub struct LockStateU32(
         write_wakers: u8 = 5,
         write_parked: u8 = 5,
         writers: u8 = 1,
-        readers: u8 = 8,
+        readers: u8 = 7,
+        upgradable: 1,
     }
 ));
 
@@ -437,7 +472,8 @@ atomic_lock_state!(pub struct LockStateU16(
         write_wakers: u8 = 2,
         write_parked: u8 = 2,
         writers: u8 = 1,
-        readers: u8 = 5,
+        readers: u8 = 4,
+        upgradable: 1,
     }
 ));
 
@@ -446,7 +482,8 @@ split_atomic_lock_state!(
     pub struct SplitLockAtomics32 {
         core: AtomicU32(u32) {
             writers: u16 = 1,
-            readers: u16 = 31,
+            readers: u16 = 30,
+            upgradable: 1,
         },
         waiters: AtomicU32(u32) {
             read_wakers: u8 = 8,

@@ -39,6 +39,10 @@ harness = false
 name = "condvar"
 harness = false
 
+[[bench]]
+name = "lock_upgradable"
+harness = false
+
 [features]
 default = ["std", "thin-vec"]
 std = ["dep:parking_lot_core"]

@@ -46,8 +46,12 @@ crate offers a fast *both* in one place.
   of hand-rolled `Notify` + re-check. The listener is registered before the guard is released, so the
   epoch snapshot-then-recheck model rules out lost wakeups. Blocking and async waiters share one
   condvar. Benched vs `std` and `parking_lot`.
-- [ ] **Upgradable read guard on `Lock`** — `upgradable_read()` → `upgrade()` (parking_lot parity).
-  Reader/writer counts are already in the packed word; mostly a new guard type + one state transition.
+- [x] **Upgradable read guard on `Lock`** — `upgradable_read()` / `try_upgradable_read()` /
+  `upgradable_read_async()`, `UpgradableReadGuard::upgrade` / `try_upgrade` / `upgrade_async` /
+  `downgrade`, plus `WriteGuard::downgrade` and `downgrade_to_upgradable`, and mapping guards
+  (`ReadGuard`/`WriteGuard` `map`/`try_map` + `MappedReadGuard`/`MappedWriteGuard`). Implemented with
+  a packed 1-bit upgradable flag (one reader bit) — benchmarked to add 0% to the read/write hot
+  paths. Benched vs `parking_lot` (blocking) and `async-std`/`async_lock` (async).
 - [ ] **`SeqLock`** — lock-free reads for small `Copy`, read-mostly data (config snapshots, counters).
   Complements `Lock` where readers must never block writers.
 - [ ] **`AtomicWaker`** — single-waiter waker cell (cf. `futures::task::AtomicWaker`); the degenerate
