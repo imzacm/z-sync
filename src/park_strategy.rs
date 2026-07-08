@@ -5,7 +5,7 @@ pub use self::std_impl::*;
 pub type DefaultParkStrategy = ParkingLot;
 
 #[cfg(not(feature = "std"))]
-pub type DefaultUnparkStrategy = Spin;
+pub type DefaultParkStrategy = Spin;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FilterOp {
