@@ -1,8 +1,9 @@
 use std::hint::black_box;
 
+use atomic_waker::AtomicWaker as CrateAtomicWaker;
 use criterion::{Criterion, criterion_group, criterion_main};
-use futures::task::noop_waker;
-use z_sync::AtomicWaker;
+use futures::task::{AtomicWaker as FuturesAtomicWaker, noop_waker};
+use z_sync::AtomicWaker as ZAtomicWaker;
 use z_sync::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
 
 // The single-waiter queue: one array slot, no spill. This is the fairest apples-to-apples for what
@@ -17,8 +18,22 @@ fn bench_register_wake(c: &mut Criterion) {
     let mut group = c.benchmark_group("register_wake");
     let waker = noop_waker();
 
-    group.bench_function("AtomicWaker", |b| {
-        let cell = AtomicWaker::new();
+    group.bench_function("z_sync::AtomicWaker", |b| {
+        let cell = ZAtomicWaker::new();
+        b.iter(|| {
+            cell.register(black_box(&waker));
+            cell.wake();
+        });
+    });
+    group.bench_function("futures::AtomicWaker", |b| {
+        let cell = FuturesAtomicWaker::new();
+        b.iter(|| {
+            cell.register(black_box(&waker));
+            cell.wake();
+        });
+    });
+    group.bench_function("atomic-waker crate", |b| {
+        let cell = CrateAtomicWaker::new();
         b.iter(|| {
             cell.register(black_box(&waker));
             cell.wake();
@@ -56,8 +71,16 @@ fn bench_register_wake(c: &mut Criterion) {
 fn bench_wake_empty(c: &mut Criterion) {
     let mut group = c.benchmark_group("wake_empty");
 
-    group.bench_function("AtomicWaker", |b| {
-        let cell = AtomicWaker::new();
+    group.bench_function("z_sync::AtomicWaker", |b| {
+        let cell = ZAtomicWaker::new();
+        b.iter(|| cell.wake());
+    });
+    group.bench_function("futures::AtomicWaker", |b| {
+        let cell = FuturesAtomicWaker::new();
+        b.iter(|| cell.wake());
+    });
+    group.bench_function("atomic-waker crate", |b| {
+        let cell = CrateAtomicWaker::new();
         b.iter(|| cell.wake());
     });
 

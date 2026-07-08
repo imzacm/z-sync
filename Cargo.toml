@@ -82,3 +82,4 @@ async-std = { version = "1.13.2", features = ["unstable"] }
 seqlock = "0.2.0"
 arc-swap = "1.9.2"
 crossbeam-utils = "0.8"
+atomic-waker = "1.1.2"

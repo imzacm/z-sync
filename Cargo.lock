@@ -1195,6 +1195,7 @@ dependencies = [
  "arc-swap",
  "async-broadcast",
  "async-std",
+ "atomic-waker",
  "criterion",
  "crossbeam-utils",
  "event-listener 5.4.1",
