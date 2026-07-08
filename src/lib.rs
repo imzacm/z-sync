@@ -8,6 +8,7 @@ extern crate std;
 
 pub mod barrier;
 pub mod channels;
+pub mod condvar;
 pub mod lock;
 pub mod notify;
 pub mod observable_lock;
@@ -33,6 +34,10 @@ pub use self::barrier::{
     Barrier, Barrier16, Barrier16Boxed, Barrier16Inline, Barrier32, Barrier32Boxed,
     Barrier32Inline, Barrier64, Barrier64Boxed, Barrier64Inline, BarrierState, BarrierStateU16,
     BarrierStateU32, BarrierStateU64, BarrierWaitResult,
+};
+pub use self::condvar::{
+    Condvar, Condvar16, Condvar16Boxed, Condvar16Inline, Condvar32, Condvar32Boxed,
+    Condvar32Inline, Condvar64, Condvar64Boxed, Condvar64Inline,
 };
 pub use self::lock::{
     Lock, Lock16, Lock16Boxed, Lock16Inline, Lock32, Lock32Boxed, Lock32Inline, Lock64,
