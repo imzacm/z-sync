@@ -57,8 +57,10 @@ crate offers a fast *both* in one place.
   or blocking writers; writers self-serialise on the odd bit. `read` / `try_read` / `write` /
   `try_write` / `set` / `get_mut` / `into_inner`. `Lock` also gained `read_copy` / `try_read_copy` /
   `read_copy_async` convenience methods (which still take the read lock — not lock-free).
-- [ ] **`AtomicWaker`** — single-waiter waker cell (cf. `futures::task::AtomicWaker`); the degenerate
-  1-waiter case of `WakerQueueLock`. A lighter building block for oneshot / single-consumer structures.
+- [x] **`AtomicWaker`** — single-waiter waker cell (cf. `futures::task::AtomicWaker`); the degenerate
+  1-waiter case of `WakerQueueLock`. Lock-free `register` / `wake` / `take`. `oneshot` now uses it for
+  the async receiver (with thread parking for the blocking receiver) instead of a full `Notify`.
+  Benched vs inline and boxed `WakerQueueLock`.
 
 ## Tier 3 — utilities worth exposing
 
