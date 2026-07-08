@@ -64,8 +64,11 @@ crate offers a fast *both* in one place.
 
 ## Tier 3 — utilities worth exposing
 
-- [ ] **`Backoff` / `SpinWait`** — promote the adaptive, arch-tuned exponential-backoff spin logic in
-  `src/lock/mod.rs` to a public utility (cf. `crossbeam_utils::Backoff`) so users can build their own
-  primitives on the same tuning.
+- [x] **`Backoff` / `SpinWait`** — promoted the adaptive, arch-tuned exponential-backoff spin logic to
+  a public utility (`src/backoff.rs`, cf. `crossbeam_utils::Backoff` / `parking_lot`'s `SpinWait`) so
+  users can build their own primitives on the same tuning. `SpinWait` is the bounded "spin then park"
+  schedule (`Lock`/`Semaphore` acquire paths); `Backoff` is the unbounded spin-forever schedule for
+  microscopic sections (`SeqLock` writer, waker-queue spinlock). All four internal call sites were
+  refactored onto them with identical tuning, de-duplicating the hand-rolled loops.
 - [ ] **`ReentrantLock`** — reentrant mutex for recursive acquisition.
 - [ ] **`ShardedLock` / striped locks** — per-shard `Lock` array for extreme read concurrency.

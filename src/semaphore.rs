@@ -6,23 +6,15 @@ use core::task::{Context, Poll, Waker};
 
 use num_traits::{ConstOne, ConstZero, NumCast, ToPrimitive};
 
+use crate::backoff::SpinWait;
 use crate::park_strategy::{DefaultParkStrategy, FilterOp, ParkStrategy};
 use crate::waker_queue::{WakerQueueLock, WakerTicket};
 use crate::waker_storage::{BoxedWakers, InlineWakers, WakerStorage};
 
 pub(crate) const ASYNC_CAPACITY: usize = 4;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const ACQUIRE_SPIN_MAX: usize = 64;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const SPIN_CAP: usize = 32;
-
-// Non-x86 spin tuning: aligned with the x86 values (more spinning, no post-spin `yield_now`). See
-// the matching note in `lock/mod.rs`.
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const ACQUIRE_SPIN_MAX: usize = 64;
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const SPIN_CAP: usize = 32;
+// The optimistic pre-park spinning is driven by [`SpinWait`], which carries the arch-tuned burst
+// cap and round budget this acquire loop was tuned to.
 
 // Async waker-storage variants. The bare `Semaphore{16,32,64}` names alias the default
 // representation (boxed: small, allocates lazily); the `Boxed`/`Inline` names select the
@@ -289,22 +281,17 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
     fn spin_try_acquire(&self, n: usize) -> Option<SemaphorePermit<'_, S, P, W>> {
         let need: S::Permits = NumCast::from(n)?;
 
-        let mut backoff = 1;
-        for _ in 0..ACQUIRE_SPIN_MAX {
+        let mut spin = SpinWait::new();
+        loop {
             if self.load_state(Ordering::Relaxed).permits() >= need
                 && let Some(guard) = self.try_acquire_many(n)
             {
                 return Some(guard);
             }
-            for _ in 0..backoff {
-                core::hint::spin_loop();
-            }
-            if backoff < SPIN_CAP {
-                backoff <<= 1;
+            if !spin.spin() {
+                return None;
             }
         }
-
-        None
     }
 
     /// Acquires a single permit, blocking the current thread until one is available.

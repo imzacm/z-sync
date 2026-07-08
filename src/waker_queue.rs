@@ -6,6 +6,8 @@ use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Waker;
 
+use crate::backoff::Backoff;
+
 /// Allow creating in const functions.
 #[cfg_attr(feature = "thin-vec", derive(Debug))]
 #[cfg(feature = "thin-vec")]
@@ -304,19 +306,13 @@ impl<const CAP: usize> WakerQueueLock<CAP> {
             return WakerQueueGuard { lock: self };
         }
 
-        let mut backoff = 1;
+        // Once the backoff caps, `Backoff::spin` keeps spinning on both x86 and Arm rather than
+        // yielding — the waker-queue lock is held only briefly, and `sched_yield` tends to hurt here.
+        let mut backoff = Backoff::new();
         loop {
             // This stays cleanly inside the CPU's local L1 cache until the lock holder releases it.
             while self.locked.load(Ordering::Relaxed) {
-                for _ in 0..backoff {
-                    core::hint::spin_loop();
-                }
-                if backoff < 64 {
-                    backoff <<= 1; // Bitwise shift is microscopically faster than *= 2
-                }
-                // Once the backoff caps, keep spinning on both x86 and Arm rather than yielding —
-                // the waker-queue lock is held only briefly, and `sched_yield`
-                // tends to hurt here.
+                backoff.spin();
             }
 
             // 3. The lock appears free, attempt to grab it
