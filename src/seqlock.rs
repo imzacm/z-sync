@@ -66,21 +66,14 @@ impl<T> SeqLock<T> {
     /// guard granting mutable access. Readers observe the new value once the guard is dropped.
     #[inline]
     pub fn write(&self) -> SeqLockWriteGuard<'_, T> {
-        let seq = self.seq.load(Ordering::Relaxed);
-        if (seq & 1) == 0
-            && self
-                .seq
-                .compare_exchange_weak(
-                    seq,
-                    seq.wrapping_add(1),
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
+        // Fast path: flip even -> odd in a single unconditional RMW. If the low bit was already set
+        // the value is unchanged (a no-op) and another writer holds the lock, so we spin instead.
+        // This is cheaper than a load + compare_exchange on the common uncontended path.
+        let old = self.seq.fetch_or(1, Ordering::Acquire);
+        if (old & 1) == 0 {
             // Keep the data writes from being reordered ahead of the odd-sequence store.
             fence(Ordering::Release);
-            return SeqLockWriteGuard { lock: self, seq: seq.wrapping_add(1) };
+            return SeqLockWriteGuard { lock: self, seq: old.wrapping_add(1) };
         }
         self.write_contended()
     }
