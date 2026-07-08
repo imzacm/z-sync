@@ -1,3 +1,5 @@
+use alloc::rc::Rc;
+use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
@@ -5,7 +7,10 @@ use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use num_traits::{ConstOne, ConstZero, NumCast, ToPrimitive};
+#[cfg(feature = "triomphe-arc")]
+use triomphe::Arc as TriompheArc;
 
+use crate::Holder;
 use crate::backoff::SpinWait;
 use crate::park_strategy::{DefaultParkStrategy, FilterOp, ParkStrategy};
 use crate::waker_queue::{WakerQueueLock, WakerTicket};
@@ -253,9 +258,18 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
     /// Returns `None` if fewer than `n` permits are available (or `n` exceeds this semaphore's
     /// capacity).
     pub fn try_acquire_many(&self, n: usize) -> Option<SemaphorePermit<'_, S, P, W>> {
+        self.try_acquire_raw(n).map(|permits| SemaphorePermit { semaphore: self, permits })
+    }
+
+    /// Attempts to reserve `n` permits without blocking, returning the number reserved on success.
+    ///
+    /// On success the permits have been deducted from the pool; the caller is responsible for
+    /// returning them (via [`add_permits`](Self::add_permits)). This is the guard-free core shared
+    /// by the borrowed and owned acquire paths.
+    fn try_acquire_raw(&self, n: usize) -> Option<usize> {
         let need: S::Permits = NumCast::from(n)?;
         if need == S::Permits::ZERO {
-            return Some(SemaphorePermit { semaphore: self, permits: 0 });
+            return Some(0);
         }
 
         let mut state = self.load_state(Ordering::Relaxed);
@@ -272,21 +286,21 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(SemaphorePermit { semaphore: self, permits: n }),
+                Ok(_) => return Some(n),
                 Err(v) => state = v,
             }
         }
     }
 
-    fn spin_try_acquire(&self, n: usize) -> Option<SemaphorePermit<'_, S, P, W>> {
+    fn spin_try_acquire_raw(&self, n: usize) -> Option<usize> {
         let need: S::Permits = NumCast::from(n)?;
 
         let mut spin = SpinWait::new();
         loop {
             if self.load_state(Ordering::Relaxed).permits() >= need
-                && let Some(guard) = self.try_acquire_many(n)
+                && let Some(permits) = self.try_acquire_raw(n)
             {
-                return Some(guard);
+                return Some(permits);
             }
             if !spin.spin() {
                 return None;
@@ -303,17 +317,25 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
     /// Acquires `n` permits, blocking the current thread until they are available.
     #[inline(always)]
     pub fn acquire_many(&self, n: usize) -> SemaphorePermit<'_, S, P, W> {
-        if let Some(guard) = self.try_acquire_many(n) {
-            return guard;
+        let permits = self.acquire_raw(n);
+        SemaphorePermit { semaphore: self, permits }
+    }
+
+    /// Blocks until `n` permits are reserved, returning the number reserved. Guard-free core shared
+    /// by the borrowed and owned blocking paths.
+    #[inline(always)]
+    fn acquire_raw(&self, n: usize) -> usize {
+        if let Some(permits) = self.try_acquire_raw(n) {
+            return permits;
         }
-        self.acquire_slow(n)
+        self.acquire_slow_raw(n)
     }
 
     #[cold]
     #[inline(never)]
-    fn acquire_slow(&self, n: usize) -> SemaphorePermit<'_, S, P, W> {
-        if let Some(guard) = self.spin_try_acquire(n) {
-            return guard;
+    fn acquire_slow_raw(&self, n: usize) -> usize {
+        if let Some(permits) = self.spin_try_acquire_raw(n) {
+            return permits;
         }
 
         let need: S::Permits = NumCast::from(n).expect("permit count exceeds semaphore capacity");
@@ -323,9 +345,9 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
         loop {
             P::park(self.parking_key(), || self.load_state(Ordering::Acquire).permits() < need);
 
-            if let Some(guard) = self.try_acquire_many(n) {
+            if let Some(permits) = self.try_acquire_raw(n) {
                 self.sub_parker(Ordering::Relaxed);
-                return guard;
+                return permits;
             }
         }
     }
@@ -340,6 +362,171 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
     #[inline(always)]
     pub fn acquire_many_async(&self, n: usize) -> AcquireFuture<'_, S, P, W> {
         AcquireFuture { semaphore: self, n, waker_node_ticket: None }
+    }
+
+    // --- Owned acquisition through an `Arc` holder ---
+
+    /// Attempts to acquire a single permit without blocking, returning an owned permit that borrows
+    /// nothing and can be moved into a spawned thread or task.
+    ///
+    /// The permit holds the semaphore through an [`Arc`], keeping it alive for as long as the
+    /// permit is held. The [`_rc`](Self::try_acquire_rc) /
+    /// [`_triomphe_arc`](Self::try_acquire_triomphe_arc) variants use other holders, or drive the
+    /// generic [`OwnedSemaphorePermit::try_acquire`] with a holder of your choice.
+    #[inline(always)]
+    pub fn try_acquire_arc(self: &Arc<Self>) -> Option<OwnedSemaphorePermit<S, P, W, Arc<Self>>> {
+        OwnedSemaphorePermit::try_acquire(Arc::clone(self))
+    }
+
+    /// Attempts to acquire `n` permits without blocking, returning an [`Arc`]-held owned permit. See
+    /// [`try_acquire_arc`](Self::try_acquire_arc).
+    #[inline(always)]
+    pub fn try_acquire_many_arc(
+        self: &Arc<Self>,
+        n: usize,
+    ) -> Option<OwnedSemaphorePermit<S, P, W, Arc<Self>>> {
+        OwnedSemaphorePermit::try_acquire_many(Arc::clone(self), n)
+    }
+
+    /// Acquires a single permit, blocking the current thread until one is available, and returns an
+    /// [`Arc`]-held owned permit. See [`try_acquire_arc`](Self::try_acquire_arc).
+    #[inline(always)]
+    pub fn acquire_arc(self: &Arc<Self>) -> OwnedSemaphorePermit<S, P, W, Arc<Self>> {
+        OwnedSemaphorePermit::acquire(Arc::clone(self))
+    }
+
+    /// Acquires `n` permits, blocking the current thread until they are available, and returns an
+    /// [`Arc`]-held owned permit. See [`try_acquire_arc`](Self::try_acquire_arc).
+    #[inline(always)]
+    pub fn acquire_many_arc(
+        self: &Arc<Self>,
+        n: usize,
+    ) -> OwnedSemaphorePermit<S, P, W, Arc<Self>> {
+        OwnedSemaphorePermit::acquire_many(Arc::clone(self), n)
+    }
+
+    /// Acquires a single permit asynchronously, resolving to an [`Arc`]-held owned permit. See
+    /// [`try_acquire_arc`](Self::try_acquire_arc).
+    #[inline(always)]
+    pub fn acquire_async_arc(self: &Arc<Self>) -> OwnedAcquireFuture<S, P, W, Arc<Self>> {
+        OwnedAcquireFuture::new(Arc::clone(self), 1)
+    }
+
+    /// Acquires `n` permits asynchronously, resolving to an [`Arc`]-held owned permit. See
+    /// [`try_acquire_arc`](Self::try_acquire_arc).
+    #[inline(always)]
+    pub fn acquire_many_async_arc(
+        self: &Arc<Self>,
+        n: usize,
+    ) -> OwnedAcquireFuture<S, P, W, Arc<Self>> {
+        OwnedAcquireFuture::new(Arc::clone(self), n)
+    }
+
+    // --- Owned acquisition through an `Rc` holder (single-threaded) ---
+
+    /// [`Rc`](alloc::rc::Rc) counterpart of [`try_acquire_arc`](Self::try_acquire_arc).
+    #[inline(always)]
+    pub fn try_acquire_rc(self: &Rc<Self>) -> Option<OwnedSemaphorePermit<S, P, W, Rc<Self>>> {
+        OwnedSemaphorePermit::try_acquire(Rc::clone(self))
+    }
+
+    /// [`Rc`](alloc::rc::Rc) counterpart of [`try_acquire_many_arc`](Self::try_acquire_many_arc).
+    #[inline(always)]
+    pub fn try_acquire_many_rc(
+        self: &Rc<Self>,
+        n: usize,
+    ) -> Option<OwnedSemaphorePermit<S, P, W, Rc<Self>>> {
+        OwnedSemaphorePermit::try_acquire_many(Rc::clone(self), n)
+    }
+
+    /// [`Rc`](alloc::rc::Rc) counterpart of [`acquire_arc`](Self::acquire_arc).
+    #[inline(always)]
+    pub fn acquire_rc(self: &Rc<Self>) -> OwnedSemaphorePermit<S, P, W, Rc<Self>> {
+        OwnedSemaphorePermit::acquire(Rc::clone(self))
+    }
+
+    /// [`Rc`](alloc::rc::Rc) counterpart of [`acquire_many_arc`](Self::acquire_many_arc).
+    #[inline(always)]
+    pub fn acquire_many_rc(self: &Rc<Self>, n: usize) -> OwnedSemaphorePermit<S, P, W, Rc<Self>> {
+        OwnedSemaphorePermit::acquire_many(Rc::clone(self), n)
+    }
+
+    /// [`Rc`](alloc::rc::Rc) counterpart of [`acquire_async_arc`](Self::acquire_async_arc).
+    #[inline(always)]
+    pub fn acquire_async_rc(self: &Rc<Self>) -> OwnedAcquireFuture<S, P, W, Rc<Self>> {
+        OwnedAcquireFuture::new(Rc::clone(self), 1)
+    }
+
+    /// [`Rc`](alloc::rc::Rc) counterpart of
+    /// [`acquire_many_async_arc`](Self::acquire_many_async_arc).
+    #[inline(always)]
+    pub fn acquire_many_async_rc(
+        self: &Rc<Self>,
+        n: usize,
+    ) -> OwnedAcquireFuture<S, P, W, Rc<Self>> {
+        OwnedAcquireFuture::new(Rc::clone(self), n)
+    }
+
+    // --- Owned acquisition through a `triomphe::Arc` holder ---
+    //
+    // `triomphe::Arc` cannot be used as a `self` receiver on stable, so these are free-standing
+    // associated functions: call them as `Semaphore::acquire_triomphe_arc(&sem)`.
+
+    /// `triomphe::Arc` counterpart of [`try_acquire_arc`](Self::try_acquire_arc).
+    #[cfg(feature = "triomphe-arc")]
+    #[inline(always)]
+    pub fn try_acquire_triomphe_arc(
+        this: &TriompheArc<Self>,
+    ) -> Option<OwnedSemaphorePermit<S, P, W, TriompheArc<Self>>> {
+        OwnedSemaphorePermit::try_acquire(TriompheArc::clone(this))
+    }
+
+    /// `triomphe::Arc` counterpart of [`try_acquire_many_arc`](Self::try_acquire_many_arc).
+    #[cfg(feature = "triomphe-arc")]
+    #[inline(always)]
+    pub fn try_acquire_many_triomphe_arc(
+        this: &TriompheArc<Self>,
+        n: usize,
+    ) -> Option<OwnedSemaphorePermit<S, P, W, TriompheArc<Self>>> {
+        OwnedSemaphorePermit::try_acquire_many(TriompheArc::clone(this), n)
+    }
+
+    /// `triomphe::Arc` counterpart of [`acquire_arc`](Self::acquire_arc).
+    #[cfg(feature = "triomphe-arc")]
+    #[inline(always)]
+    pub fn acquire_triomphe_arc(
+        this: &TriompheArc<Self>,
+    ) -> OwnedSemaphorePermit<S, P, W, TriompheArc<Self>> {
+        OwnedSemaphorePermit::acquire(TriompheArc::clone(this))
+    }
+
+    /// `triomphe::Arc` counterpart of [`acquire_many_arc`](Self::acquire_many_arc).
+    #[cfg(feature = "triomphe-arc")]
+    #[inline(always)]
+    pub fn acquire_many_triomphe_arc(
+        this: &TriompheArc<Self>,
+        n: usize,
+    ) -> OwnedSemaphorePermit<S, P, W, TriompheArc<Self>> {
+        OwnedSemaphorePermit::acquire_many(TriompheArc::clone(this), n)
+    }
+
+    /// `triomphe::Arc` counterpart of [`acquire_async_arc`](Self::acquire_async_arc).
+    #[cfg(feature = "triomphe-arc")]
+    #[inline(always)]
+    pub fn acquire_async_triomphe_arc(
+        this: &TriompheArc<Self>,
+    ) -> OwnedAcquireFuture<S, P, W, TriompheArc<Self>> {
+        OwnedAcquireFuture::new(TriompheArc::clone(this), 1)
+    }
+
+    /// `triomphe::Arc` counterpart of [`acquire_many_async_arc`](Self::acquire_many_async_arc).
+    #[cfg(feature = "triomphe-arc")]
+    #[inline(always)]
+    pub fn acquire_many_async_triomphe_arc(
+        this: &TriompheArc<Self>,
+        n: usize,
+    ) -> OwnedAcquireFuture<S, P, W, TriompheArc<Self>> {
+        OwnedAcquireFuture::new(TriompheArc::clone(this), n)
     }
 
     /// Adds `n` permits back to the semaphore, waking waiters as needed.
@@ -442,6 +629,81 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
         });
 
         remaining - unparked
+    }
+
+    /// Guard-free core of the async acquire poll, shared by the borrowed [`AcquireFuture`] and the
+    /// owned [`OwnedAcquireFuture`].
+    ///
+    /// On [`Poll::Ready`] the returned permits have been reserved (deducted from the pool); the
+    /// caller wraps them in whichever permit guard it owns.
+    fn poll_acquire_raw(
+        &self,
+        waker_node_ticket: &mut Option<WakerTicket>,
+        n: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<usize> {
+        if let Some(permits) = self.try_acquire_raw(n) {
+            if let Some(ticket) = waker_node_ticket.take()
+                && self.get_wakers().lock().remove(ticket)
+            {
+                self.sub_waker(Ordering::Relaxed);
+            }
+            return Poll::Ready(permits);
+        }
+
+        {
+            let mut queue = self.get_wakers().lock();
+
+            if let Some(permits) = self.try_acquire_raw(n) {
+                if let Some(ticket) = waker_node_ticket.take()
+                    && queue.remove(ticket)
+                {
+                    self.sub_waker(Ordering::Relaxed);
+                }
+                return Poll::Ready(permits);
+            }
+
+            if let Some(ticket) = *waker_node_ticket {
+                let node = queue.node_mut(ticket.index());
+
+                if node.generation() == ticket.generation() {
+                    if node.waker().is_none_or(|w| !w.will_wake(cx.waker())) {
+                        *node.waker_mut() = Some(cx.waker().clone());
+                    }
+                } else {
+                    // Our slot was popped and recycled by a previous wakeup. We must re-enqueue
+                    // ourselves to prevent a lost wakeup.
+                    *waker_node_ticket = Some(queue.push(cx.waker().clone()));
+                    self.add_waker(Ordering::SeqCst);
+                }
+            } else {
+                *waker_node_ticket = Some(queue.push(cx.waker().clone()));
+                self.add_waker(Ordering::SeqCst);
+            }
+        }
+
+        if let Some(permits) = self.try_acquire_raw(n) {
+            if let Some(ticket) = waker_node_ticket.take()
+                && self.get_wakers().lock().remove(ticket)
+            {
+                self.sub_waker(Ordering::Relaxed);
+            }
+            return Poll::Ready(permits);
+        }
+
+        Poll::Pending
+    }
+
+    /// Removes a pending waker ticket when an acquire future is dropped before completing.
+    ///
+    /// If the waker was already consumed by a release that intended to wake us, forwards the wakeup
+    /// so the released permit isn't stranded. Shared by both acquire-future drop paths.
+    fn cancel_acquire(&self, ticket: WakerTicket) {
+        if self.get_wakers().lock().remove(ticket) {
+            self.sub_waker(Ordering::Relaxed);
+        } else {
+            self.forward_wake();
+        }
     }
 
     /// Forwards a single wakeup to the next waiter.
@@ -560,56 +822,12 @@ impl<'a, S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Fu
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
 
-        if let Some(guard) = this.semaphore.try_acquire_many(this.n) {
-            if let Some(ticket) = this.waker_node_ticket.take()
-                && this.semaphore.get_wakers().lock().remove(ticket)
-            {
-                this.semaphore.sub_waker(Ordering::Relaxed);
+        match this.semaphore.poll_acquire_raw(&mut this.waker_node_ticket, this.n, cx) {
+            Poll::Ready(permits) => {
+                Poll::Ready(SemaphorePermit { semaphore: this.semaphore, permits })
             }
-            return Poll::Ready(guard);
+            Poll::Pending => Poll::Pending,
         }
-
-        {
-            let mut queue = this.semaphore.get_wakers().lock();
-
-            if let Some(guard) = this.semaphore.try_acquire_many(this.n) {
-                if let Some(ticket) = this.waker_node_ticket.take()
-                    && queue.remove(ticket)
-                {
-                    this.semaphore.sub_waker(Ordering::Relaxed);
-                }
-                return Poll::Ready(guard);
-            }
-
-            if let Some(ticket) = this.waker_node_ticket {
-                let node = queue.node_mut(ticket.index());
-
-                if node.generation() == ticket.generation() {
-                    if node.waker().is_none_or(|w| !w.will_wake(cx.waker())) {
-                        *node.waker_mut() = Some(cx.waker().clone());
-                    }
-                } else {
-                    // Our slot was popped and recycled by a previous wakeup. We must re-enqueue
-                    // ourselves to prevent a lost wakeup.
-                    this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                    this.semaphore.add_waker(Ordering::SeqCst);
-                }
-            } else {
-                this.waker_node_ticket = Some(queue.push(cx.waker().clone()));
-                this.semaphore.add_waker(Ordering::SeqCst);
-            }
-        }
-
-        if let Some(guard) = this.semaphore.try_acquire_many(this.n) {
-            if let Some(ticket) = this.waker_node_ticket.take()
-                && this.semaphore.get_wakers().lock().remove(ticket)
-            {
-                this.semaphore.sub_waker(Ordering::Relaxed);
-            }
-            return Poll::Ready(guard);
-        }
-
-        Poll::Pending
     }
 }
 
@@ -617,14 +835,164 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Drop
     for AcquireFuture<'_, S, P, W>
 {
     fn drop(&mut self) {
-        let Some(ticket) = self.waker_node_ticket.take() else { return };
+        if let Some(ticket) = self.waker_node_ticket.take() {
+            self.semaphore.cancel_acquire(ticket);
+        }
+    }
+}
 
-        if self.semaphore.get_wakers().lock().remove(ticket) {
-            self.semaphore.sub_waker(Ordering::Relaxed);
-        } else {
-            // Our waker was already consumed by a release that intended to wake us. As we're being
-            // dropped before acquiring, forward the wakeup so the released permit isn't stranded.
-            self.semaphore.forward_wake();
+/// Zero-sized marker binding the `S`/`P`/`W` type parameters of the owned handles (which otherwise
+/// only appear through the holder `H`'s target type) without affecting their auto traits.
+type OwnedMarker<S, P, W> = PhantomData<fn() -> (S, P, W)>;
+
+/// An owned permit representing one or more acquired permits.
+///
+/// Unlike the borrowed [`SemaphorePermit`], this holds the `Semaphore` through an owned holder `H`
+/// — a std [`Arc`] (the default), a `triomphe::Arc`, or an [`Rc`](alloc::rc::Rc) — so it borrows
+/// nothing and can be moved into a spawned thread or task. Construct one from an
+/// [`Arc<Semaphore>`](Arc) via [`Semaphore::acquire_arc`] (and its `try_`/`many`/`async` siblings,
+/// plus the `_rc` / `_triomphe_arc` holder variants), or from any holder via the generic
+/// [`try_acquire`](Self::try_acquire) / [`acquire`](Self::acquire) constructors.
+///
+/// The permits are returned to the semaphore when this guard is dropped, unless
+/// [`forget`](Self::forget) is called first.
+#[derive(Debug)]
+pub struct OwnedSemaphorePermit<
+    S: SemaphoreState = SemaphoreStateU32,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+    H: Holder<Semaphore<S, P, W>> = Arc<Semaphore<S, P, W>>,
+> {
+    semaphore: H,
+    permits: usize,
+    /// `S`, `P` and `W` are only referenced through `H`'s target type; keep them without affecting
+    /// the permit's auto traits.
+    _marker: OwnedMarker<S, P, W>,
+}
+
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
+    OwnedSemaphorePermit<S, P, W, H>
+{
+    /// Attempts to acquire a single permit from `holder` without blocking.
+    ///
+    /// Clone your holder and pass it by value: `OwnedSemaphorePermit::try_acquire(Arc::clone(&sem))`.
+    #[inline(always)]
+    pub fn try_acquire(holder: H) -> Option<Self> {
+        Self::try_acquire_many(holder, 1)
+    }
+
+    /// Attempts to acquire `n` permits from `holder` without blocking.
+    ///
+    /// Returns `None` if fewer than `n` permits are available (or `n` exceeds the semaphore's
+    /// capacity), dropping the holder clone.
+    pub fn try_acquire_many(holder: H, n: usize) -> Option<Self> {
+        holder
+            .try_acquire_raw(n)
+            .map(|permits| Self { semaphore: holder, permits, _marker: PhantomData })
+    }
+
+    /// Acquires a single permit from `holder`, blocking the current thread until one is available.
+    #[inline(always)]
+    pub fn acquire(holder: H) -> Self {
+        Self::acquire_many(holder, 1)
+    }
+
+    /// Acquires `n` permits from `holder`, blocking the current thread until they are available.
+    pub fn acquire_many(holder: H, n: usize) -> Self {
+        let permits = holder.acquire_raw(n);
+        Self { semaphore: holder, permits, _marker: PhantomData }
+    }
+
+    /// The holder this permit keeps the semaphore alive through.
+    #[inline(always)]
+    pub fn semaphore(&self) -> &H {
+        &self.semaphore
+    }
+
+    /// The number of permits held by this guard.
+    #[inline(always)]
+    pub fn permits(&self) -> usize {
+        self.permits
+    }
+
+    /// Drops the guard without returning its permits to the semaphore, permanently reducing the
+    /// number of available permits.
+    #[inline(always)]
+    pub fn forget(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
+    Drop for OwnedSemaphorePermit<S, P, W, H>
+{
+    fn drop(&mut self) {
+        if self.permits > 0 {
+            self.semaphore.add_permits(self.permits);
+        }
+    }
+}
+
+/// A future that resolves to an [`OwnedSemaphorePermit`].
+///
+/// Created by [`Semaphore::acquire_async_arc`] / [`acquire_many_async_arc`](Semaphore::acquire_many_async_arc)
+/// (and the `_rc` / `_triomphe_arc` holder variants) or the generic [`OwnedAcquireFuture::new`].
+/// Like [`OwnedSemaphorePermit`] it holds the semaphore through an owned holder `H`, so the future
+/// (and the permit it yields) borrows nothing.
+#[derive(Debug)]
+pub struct OwnedAcquireFuture<
+    S: SemaphoreState = SemaphoreStateU32,
+    P: ParkStrategy = DefaultParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY> = BoxedWakers<ASYNC_CAPACITY>,
+    H: Holder<Semaphore<S, P, W>> = Arc<Semaphore<S, P, W>>,
+> {
+    semaphore: H,
+    n: usize,
+    waker_node_ticket: Option<WakerTicket>,
+    /// `S`, `P` and `W` are only referenced through `H`'s target type; keep them without affecting
+    /// the future's auto traits.
+    _marker: OwnedMarker<S, P, W>,
+}
+
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
+    OwnedAcquireFuture<S, P, W, H>
+{
+    /// Creates a future that acquires `n` permits from `holder`, resolving once they are available.
+    ///
+    /// Clone your holder and pass it by value: `OwnedAcquireFuture::new(Arc::clone(&sem), 1)`.
+    #[inline(always)]
+    pub fn new(holder: H, n: usize) -> Self {
+        Self { semaphore: holder, n, waker_node_ticket: None, _marker: PhantomData }
+    }
+}
+
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
+    Future for OwnedAcquireFuture<S, P, W, H>
+where
+    H: Unpin,
+{
+    type Output = OwnedSemaphorePermit<S, P, W, H>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+
+        match this.semaphore.poll_acquire_raw(&mut this.waker_node_ticket, this.n, cx) {
+            Poll::Ready(permits) => Poll::Ready(OwnedSemaphorePermit {
+                semaphore: this.semaphore.clone(),
+                permits,
+                _marker: PhantomData,
+            }),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
+    Drop for OwnedAcquireFuture<S, P, W, H>
+{
+    fn drop(&mut self) {
+        if let Some(ticket) = self.waker_node_ticket.take() {
+            self.semaphore.cancel_acquire(ticket);
         }
     }
 }
@@ -881,6 +1249,179 @@ mod tests {
         drop(held);
 
         waiter.await.unwrap();
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Owned permit tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn try_acquire_arc_reduces_and_returns_permits() {
+        let sem = Arc::new(Semaphore::new(2));
+        let a = sem.try_acquire_arc().unwrap();
+        assert_eq!(a.permits(), 1);
+        assert_eq!(sem.available_permits(), 1);
+        assert!(Arc::ptr_eq(a.semaphore(), &sem));
+        drop(a);
+        assert_eq!(sem.available_permits(), 2);
+    }
+
+    #[test]
+    fn try_acquire_many_arc_all_or_nothing() {
+        let sem = Arc::new(Semaphore::new(3));
+        assert!(sem.try_acquire_many_arc(4).is_none());
+        let g = sem.try_acquire_many_arc(3).unwrap();
+        assert_eq!(sem.available_permits(), 0);
+        drop(g);
+        assert_eq!(sem.available_permits(), 3);
+    }
+
+    #[test]
+    fn arc_permit_forget_keeps_permits() {
+        let sem = Arc::new(Semaphore::new(1));
+        sem.acquire_arc().forget();
+        assert_eq!(sem.available_permits(), 0);
+        assert!(sem.try_acquire_arc().is_none());
+    }
+
+    #[test]
+    fn rc_permit_acquires_and_releases() {
+        let sem = std::rc::Rc::new(Semaphore::new(2));
+        let a = sem.acquire_rc();
+        let b = sem.try_acquire_rc().unwrap();
+        assert_eq!(sem.available_permits(), 0);
+        assert!(sem.try_acquire_rc().is_none());
+        assert!(std::rc::Rc::ptr_eq(a.semaphore(), &sem));
+        drop((a, b));
+        assert_eq!(sem.available_permits(), 2);
+
+        let many = sem.acquire_many_rc(2);
+        assert_eq!(many.permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn rc_async_acquire_returns_permit() {
+        let sem = std::rc::Rc::new(Semaphore::new(1));
+        let g = sem.acquire_async_rc().await;
+        assert_eq!(sem.available_permits(), 0);
+        drop(g);
+        let g = sem.acquire_many_async_rc(1).await;
+        assert_eq!(g.permits(), 1);
+    }
+
+    #[cfg(feature = "triomphe-arc")]
+    #[test]
+    fn triomphe_arc_permit_acquires_and_releases() {
+        let sem = triomphe::Arc::new(Semaphore::new(2));
+        let a = Semaphore::acquire_triomphe_arc(&sem);
+        let b = Semaphore::try_acquire_triomphe_arc(&sem).unwrap();
+        assert_eq!(sem.available_permits(), 0);
+        assert!(Semaphore::try_acquire_triomphe_arc(&sem).is_none());
+        assert_eq!(a.permits() + b.permits(), 2);
+        drop((a, b));
+        assert_eq!(sem.available_permits(), 2);
+
+        let many = Semaphore::try_acquire_many_triomphe_arc(&sem, 2).unwrap();
+        assert_eq!(many.permits(), 2);
+    }
+
+    #[cfg(feature = "triomphe-arc")]
+    #[tokio::test]
+    async fn triomphe_arc_async_acquire_returns_permit() {
+        let sem = triomphe::Arc::new(Semaphore::new(1));
+        let g = Semaphore::acquire_async_triomphe_arc(&sem).await;
+        assert_eq!(sem.available_permits(), 0);
+        drop(g);
+        let g = Semaphore::acquire_many_async_triomphe_arc(&sem, 1).await;
+        assert_eq!(g.permits(), 1);
+    }
+
+    #[test]
+    fn owned_permit_outlives_moving_into_thread() {
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.acquire_arc();
+
+        // The owned permit borrows nothing, so it can move into a spawned thread while the
+        // original Arc handle is dropped here.
+        let sem_check = Arc::clone(&sem);
+        drop(sem);
+
+        let handle = std::thread::spawn(move || {
+            assert_eq!(permit.permits(), 1);
+            // permit dropped at end of thread, releasing back to the still-alive semaphore.
+        });
+        handle.join().unwrap();
+
+        assert_eq!(sem_check.available_permits(), 1);
+    }
+
+    #[test]
+    fn owned_blocking_acquire_waits_for_release() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.acquire_arc();
+
+        let sem2 = Arc::clone(&sem);
+        let waiter = std::thread::spawn(move || {
+            let _g = sem2.acquire_arc();
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        drop(held);
+
+        waiter.join().unwrap();
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_async_acquire_returns_permit() {
+        let sem = Arc::new(Semaphore::new(1));
+        let g = sem.acquire_async_arc().await;
+        assert_eq!(sem.available_permits(), 0);
+        drop(g);
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_async_acquire_moves_into_task() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.acquire();
+
+        // acquire_async_arc yields a 'static future/permit, so it can move into a spawned task.
+        let fut = sem.acquire_many_async_arc(1);
+        let waiter = tokio::spawn(async move {
+            let g = fut.await;
+            assert_eq!(g.permits(), 1);
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        waiter.await.unwrap();
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_dropped_acquire_future_does_not_leak_waker_count() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.acquire();
+
+        let sem2 = Arc::clone(&sem);
+        let fut = tokio::spawn(async move {
+            tokio::select! {
+                _g = sem2.acquire_async_arc() => {},
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {},
+            }
+        });
+
+        fut.await.unwrap();
+        drop(held);
+
+        assert_eq!(
+            sem.load_state(Ordering::Relaxed).wakers(),
+            0,
+            "waker count leaked after OwnedAcquireFuture was dropped"
+        );
         assert_eq!(sem.available_permits(), 1);
     }
 }
