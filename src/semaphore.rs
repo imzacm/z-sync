@@ -17,13 +17,12 @@ const ACQUIRE_SPIN_MAX: usize = 64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const SPIN_CAP: usize = 32;
 
+// Non-x86 spin tuning: aligned with the x86 values (more spinning, no post-spin `yield_now`). See
+// the matching note in `lock/mod.rs`.
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const ACQUIRE_SPIN_MAX: usize = 32;
+const ACQUIRE_SPIN_MAX: usize = 64;
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-const SPIN_CAP: usize = 16;
-
-#[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
-const SPIN_YIELD_MAX: usize = 8;
+const SPIN_CAP: usize = 32;
 
 // Async waker-storage variants. The bare `Semaphore{16,32,64}` names alias the default
 // representation (boxed: small, allocates lazily); the `Boxed`/`Inline` names select the
@@ -303,17 +302,6 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
             if backoff < SPIN_CAP {
                 backoff <<= 1;
             }
-        }
-
-        // x86 seems to perform better without yielding.
-        #[cfg(all(not(any(target_arch = "x86", target_arch = "x86_64")), feature = "std"))]
-        for _ in 0..SPIN_YIELD_MAX {
-            if self.load_state(Ordering::Relaxed).permits() >= need
-                && let Some(guard) = self.try_acquire_many(n)
-            {
-                return Some(guard);
-            }
-            std::thread::yield_now();
         }
 
         None
