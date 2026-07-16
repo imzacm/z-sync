@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod atomic_arc;
 pub mod atomic_waker;
 pub mod backoff;
 pub mod barrier;
@@ -33,6 +34,7 @@ pub trait Holder<T: ?Sized>: core::ops::Deref<Target = T> + Clone {}
 
 impl<T: ?Sized, H: core::ops::Deref<Target = T> + Clone> Holder<T> for H {}
 
+pub use self::atomic_arc::{AtomicArc, RawArc};
 pub use self::atomic_waker::AtomicWaker;
 pub use self::backoff::{Backoff, SpinWait};
 pub use self::barrier::{
@@ -53,7 +55,9 @@ pub use self::notify::{
     Notify64, Notify64Boxed, Notify64Inline, NotifyState, NotifyStateU16, NotifyStateU32,
     NotifyStateU64,
 };
-pub use self::observable_lock::ObservableLock;
+#[cfg(feature = "triomphe-arc")]
+pub use self::observable_lock::TriompheArcObservableLock;
+pub use self::observable_lock::{ArcObservableLock, ObservableLock};
 pub use self::once::{Lazy, Once, OnceCell};
 pub use self::park_strategy::ParkStrategy;
 pub use self::semaphore::{
