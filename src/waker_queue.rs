@@ -307,7 +307,8 @@ impl<const CAP: usize> WakerQueueLock<CAP> {
         }
 
         // Once the backoff caps, `Backoff::spin` keeps spinning on both x86 and Arm rather than
-        // yielding — the waker-queue lock is held only briefly, and `sched_yield` tends to hurt here.
+        // yielding — the waker-queue lock is held only briefly, and `sched_yield` tends to hurt
+        // here.
         let mut backoff = Backoff::new();
         loop {
             // This stays cleanly inside the CPU's local L1 cache until the lock holder releases it.
