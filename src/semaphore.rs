@@ -258,7 +258,8 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
     /// Returns `None` if fewer than `n` permits are available (or `n` exceeds this semaphore's
     /// capacity).
     pub fn try_acquire_many(&self, n: usize) -> Option<SemaphorePermit<'_, S, P, W>> {
-        self.try_acquire_raw(n).map(|permits| SemaphorePermit { semaphore: self, permits })
+        self.try_acquire_raw(n)
+            .map(|permits| SemaphorePermit { semaphore: self, permits })
     }
 
     /// Attempts to reserve `n` permits without blocking, returning the number reserved on success.
@@ -378,8 +379,8 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>> Semaph
         OwnedSemaphorePermit::try_acquire(Arc::clone(self))
     }
 
-    /// Attempts to acquire `n` permits without blocking, returning an [`Arc`]-held owned permit. See
-    /// [`try_acquire_arc`](Self::try_acquire_arc).
+    /// Attempts to acquire `n` permits without blocking, returning an [`Arc`]-held owned permit.
+    /// See [`try_acquire_arc`](Self::try_acquire_arc).
     #[inline(always)]
     pub fn try_acquire_many_arc(
         self: &Arc<Self>,
@@ -870,12 +871,17 @@ pub struct OwnedSemaphorePermit<
     _marker: OwnedMarker<S, P, W>,
 }
 
-impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
-    OwnedSemaphorePermit<S, P, W, H>
+impl<
+    S: SemaphoreState,
+    P: ParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY>,
+    H: Holder<Semaphore<S, P, W>>,
+> OwnedSemaphorePermit<S, P, W, H>
 {
     /// Attempts to acquire a single permit from `holder` without blocking.
     ///
-    /// Clone your holder and pass it by value: `OwnedSemaphorePermit::try_acquire(Arc::clone(&sem))`.
+    /// Clone your holder and pass it by value:
+    /// `OwnedSemaphorePermit::try_acquire(Arc::clone(&sem))`.
     #[inline(always)]
     pub fn try_acquire(holder: H) -> Option<Self> {
         Self::try_acquire_many(holder, 1)
@@ -886,9 +892,11 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Hol
     /// Returns `None` if fewer than `n` permits are available (or `n` exceeds the semaphore's
     /// capacity), dropping the holder clone.
     pub fn try_acquire_many(holder: H, n: usize) -> Option<Self> {
-        holder
-            .try_acquire_raw(n)
-            .map(|permits| Self { semaphore: holder, permits, _marker: PhantomData })
+        holder.try_acquire_raw(n).map(|permits| Self {
+            semaphore: holder,
+            permits,
+            _marker: PhantomData,
+        })
     }
 
     /// Acquires a single permit from `holder`, blocking the current thread until one is available.
@@ -923,8 +931,12 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Hol
     }
 }
 
-impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
-    Drop for OwnedSemaphorePermit<S, P, W, H>
+impl<
+    S: SemaphoreState,
+    P: ParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY>,
+    H: Holder<Semaphore<S, P, W>>,
+> Drop for OwnedSemaphorePermit<S, P, W, H>
 {
     fn drop(&mut self) {
         if self.permits > 0 {
@@ -935,10 +947,11 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Hol
 
 /// A future that resolves to an [`OwnedSemaphorePermit`].
 ///
-/// Created by [`Semaphore::acquire_async_arc`] / [`acquire_many_async_arc`](Semaphore::acquire_many_async_arc)
-/// (and the `_rc` / `_triomphe_arc` holder variants) or the generic [`OwnedAcquireFuture::new`].
-/// Like [`OwnedSemaphorePermit`] it holds the semaphore through an owned holder `H`, so the future
-/// (and the permit it yields) borrows nothing.
+/// Created by [`Semaphore::acquire_async_arc`] /
+/// [`acquire_many_async_arc`](Semaphore::acquire_many_async_arc) (and the `_rc` / `_triomphe_arc`
+/// holder variants) or the generic [`OwnedAcquireFuture::new`]. Like [`OwnedSemaphorePermit`] it
+/// holds the semaphore through an owned holder `H`, so the future (and the permit it yields)
+/// borrows nothing.
 #[derive(Debug)]
 pub struct OwnedAcquireFuture<
     S: SemaphoreState = SemaphoreStateU32,
@@ -954,8 +967,12 @@ pub struct OwnedAcquireFuture<
     _marker: OwnedMarker<S, P, W>,
 }
 
-impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
-    OwnedAcquireFuture<S, P, W, H>
+impl<
+    S: SemaphoreState,
+    P: ParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY>,
+    H: Holder<Semaphore<S, P, W>>,
+> OwnedAcquireFuture<S, P, W, H>
 {
     /// Creates a future that acquires `n` permits from `holder`, resolving once they are available.
     ///
@@ -966,8 +983,12 @@ impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Hol
     }
 }
 
-impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
-    Future for OwnedAcquireFuture<S, P, W, H>
+impl<
+    S: SemaphoreState,
+    P: ParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY>,
+    H: Holder<Semaphore<S, P, W>>,
+> Future for OwnedAcquireFuture<S, P, W, H>
 where
     H: Unpin,
 {
@@ -987,8 +1008,12 @@ where
     }
 }
 
-impl<S: SemaphoreState, P: ParkStrategy, W: WakerStorage<ASYNC_CAPACITY>, H: Holder<Semaphore<S, P, W>>>
-    Drop for OwnedAcquireFuture<S, P, W, H>
+impl<
+    S: SemaphoreState,
+    P: ParkStrategy,
+    W: WakerStorage<ASYNC_CAPACITY>,
+    H: Holder<Semaphore<S, P, W>>,
+> Drop for OwnedAcquireFuture<S, P, W, H>
 {
     fn drop(&mut self) {
         if let Some(ticket) = self.waker_node_ticket.take() {

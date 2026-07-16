@@ -94,7 +94,11 @@ where
 
 impl<T, S: LockState, P: ParkStrategy> Lock<T, S, P, BoxedWakers<ASYNC_CAPACITY>> {
     #[inline(always)]
-    pub fn into_observable<N: NotifyState>(self) -> crate::ObservableLock<T, S, N, P>
+    /// `A` is the shared pointer the observable publishes its value through; it is left last so
+    /// that an explicit `into_observable::<SomeNotifyState>()` still infers it from the binding.
+    pub fn into_observable<N: NotifyState, A: crate::RawArc<Target = T>>(
+        self,
+    ) -> crate::ObservableLock<T, A, S, N, P>
     where
         T: Clone,
     {

@@ -51,6 +51,14 @@ harness = false
 name = "atomic_waker"
 harness = false
 
+[[bench]]
+name = "atomic_arc"
+harness = false
+
+[[bench]]
+name = "observable_lock"
+harness = false
+
 [features]
 default = ["std", "thin-vec"]
 std = ["dep:parking_lot_core"]

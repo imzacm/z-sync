@@ -62,8 +62,8 @@ pub fn select_blocking(listeners: &mut [NotifyListener<'_>]) -> Option<usize> {
                 }
             }
 
-            // We use a validation closure to ensure we don't sleep if a notification arrived between
-            // the poll and the park call.
+            // We use a validation closure to ensure we don't sleep if a notification arrived
+            // between the poll and the park call.
             unsafe {
                 parking_lot_core::park(
                     key,

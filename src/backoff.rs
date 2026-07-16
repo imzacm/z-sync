@@ -2,10 +2,11 @@
 //!
 //! Every blocking primitive in this crate does a short bout of optimistic spinning before it falls
 //! back to parking (or, for microscopic critical sections, spins outright). That spinning is not a
-//! naive busy loop: it emits an *exponentially growing burst* of [`spin_loop`](core::hint::spin_loop)
-//! hints, doubling the burst each round up to a cap. A tiny first burst keeps latency low when the
-//! contended resource frees almost immediately; the growth throttles bus traffic when it does not,
-//! and the cap stops the burst from growing so large that it overshoots the release badly.
+//! naive busy loop: it emits an *exponentially growing burst* of
+//! [`spin_loop`](core::hint::spin_loop) hints, doubling the burst each round up to a cap. A tiny
+//! first burst keeps latency low when the contended resource frees almost immediately; the growth
+//! throttles bus traffic when it does not, and the cap stops the burst from growing so large that
+//! it overshoots the release badly.
 //!
 //! These two types promote that logic — previously duplicated across [`Lock`](crate::Lock),
 //! [`Semaphore`](crate::Semaphore), [`SeqLock`](crate::SeqLock), and the internal waker-queue
@@ -62,10 +63,10 @@ const BACKOFF_CAP: u32 = 64;
 /// A bounded exponential-backoff spinner: spin optimistically for a fixed budget, then park.
 ///
 /// `SpinWait` drives the "try, then spin, then eventually block" loop used by the crate's
-/// [`Lock`](crate::Lock) and [`Semaphore`](crate::Semaphore) acquire paths. Call [`spin`] after each
-/// failed attempt; it emits a growing burst of [`spin_loop`](core::hint::spin_loop) hints and returns
-/// `true` while spinning is still worthwhile, or `false` once the budget is spent — the cue to park
-/// the thread (or register a waker) instead of spinning further.
+/// [`Lock`](crate::Lock) and [`Semaphore`](crate::Semaphore) acquire paths. Call [`spin`] after
+/// each failed attempt; it emits a growing burst of [`spin_loop`](core::hint::spin_loop) hints and
+/// returns `true` while spinning is still worthwhile, or `false` once the budget is spent — the cue
+/// to park the thread (or register a waker) instead of spinning further.
 ///
 /// The burst doubles each round (1, 2, 4, …, capped) and the spinner gives up after a fixed number
 /// of rounds. Both are the values the crate's own locks were tuned to.
@@ -120,8 +121,9 @@ impl SpinWait {
 
     /// Emits one exponentially growing burst of spin hints and advances the schedule.
     ///
-    /// Returns `true` if the caller should keep spinning (attempt again after this call), or `false`
-    /// once the round budget is exhausted, meaning the caller should stop spinning and park/block.
+    /// Returns `true` if the caller should keep spinning (attempt again after this call), or
+    /// `false` once the round budget is exhausted, meaning the caller should stop spinning and
+    /// park/block.
     ///
     /// Once `false` has been returned, further calls keep spinning at the capped burst but continue
     /// to return `false`; [`reset`](SpinWait::reset) to start a new bounded wait.
@@ -140,8 +142,9 @@ impl SpinWait {
         self.rounds < SPIN_WAIT_ROUNDS
     }
 
-    /// Returns `true` once the spinner has spun its full budget (the next/previous [`spin`] returned
-    /// or would return `false`). Useful when the spin and the give-up test live in different places.
+    /// Returns `true` once the spinner has spun its full budget (the next/previous [`spin`]
+    /// returned or would return `false`). Useful when the spin and the give-up test live in
+    /// different places.
     ///
     /// [`spin`]: SpinWait::spin
     #[inline(always)]
@@ -163,8 +166,8 @@ impl Default for SpinWait {
 /// [`SeqLock`](crate::SeqLock)'s contended writer and the crate's internal waker-queue spinlock.
 /// Their critical sections are a few instructions long, so the release is always imminent and
 /// parking would cost far more than spinning through it. [`spin`](Backoff::spin) emits a growing
-/// burst of [`spin_loop`](core::hint::spin_loop) hints that doubles up to a cap and then stays there,
-/// keeping the waiting core parked in its own L1 cache line rather than hammering the bus.
+/// burst of [`spin_loop`](core::hint::spin_loop) hints that doubles up to a cap and then stays
+/// there, keeping the waiting core parked in its own L1 cache line rather than hammering the bus.
 ///
 /// Unlike [`SpinWait`], `Backoff` never reports "give up" — it is meant for loops with no park
 /// fallback. [`is_completed`](Backoff::is_completed) is offered only as a hint (the burst has
